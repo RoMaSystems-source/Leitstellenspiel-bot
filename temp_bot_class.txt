@@ -1,0 +1,1751 @@
+﻿#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Leitstellenspiel.de Bot
+Automatisiert das Abarbeiten von EinsÃ¤tzen und Nachalarmierungen
+"""
+
+import requests
+from bs4 import BeautifulSoup
+import json
+import time
+import logging
+from datetime import datetime
+from colorama import init, Fore, Style
+import sys
+import os
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException, NoSuchElementException, NoAlertPresentException
+from selenium.webdriver.chrome.options import Options as ChromeOptions
+from selenium.webdriver.firefox.options import Options as FirefoxOptions
+import random
+from vehicle_types import VEHICLE_TYPES, CATEGORY_TO_TYPES
+
+# Colorama initialisieren
+init(autoreset=True)
+
+class LeitstellenspielBot:
+    def __init__(self, config_path='config.json'):
+        """Initialisiert den Bot mit der Konfiguration"""
+        # Erstelle Cache-Ordner
+        self.cache_dir = 'cache'
+        if not os.path.exists(self.cache_dir):
+            os.makedirs(self.cache_dir)
+
+        self.config = self.load_config(config_path)
+        self.session = requests.Session()
+        self.driver = None
+        self.base_url = 'https://www.leitstellenspiel.de'
+        self.setup_logging()
+        self.logged_in = False
+        self.mission_cache = {}
+        self.mission_cache_file = os.path.join(self.cache_dir, 'mission_cache.json')
+        self.mission_cache_age = None
+
+        # API-Daten Cache
+        self.api_vehicles = []
+        self.api_buildings = []
+        self.api_vehicle_types = {}  # Mapping von vehicle_type ID zu Name
+        
+    def load_config(self, config_path):
+        """LÃ¤dt die Konfigurationsdatei"""
+        try:
+            with open(config_path, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except FileNotFoundError:
+            print(f"{Fore.RED}Fehler: config.json nicht gefunden!")
+            print(f"{Fore.YELLOW}Bitte kopieren Sie config.json.example zu config.json und tragen Sie Ihre Daten ein.")
+            sys.exit(1)
+        except json.JSONDecodeError as e:
+            print(f"{Fore.RED}Fehler beim Lesen der config.json: {e}")
+            sys.exit(1)
+    
+    def setup_logging(self):
+        """Richtet das Logging-System ein"""
+        # Hole Logging-Konfiguration mit Defaults
+        logging_config = self.config.get('logging', {})
+        log_level = getattr(logging, logging_config.get('level', 'INFO'), logging.INFO)
+        log_file = os.path.join(self.cache_dir, logging_config.get('file', 'bot.log'))
+
+        logging.basicConfig(
+            level=log_level,
+            format='%(asctime)s - %(levelname)s - %(message)s',
+            handlers=[
+                logging.FileHandler(log_file, encoding='utf-8'),
+                logging.StreamHandler()
+            ]
+        )
+        self.logger = logging.getLogger(__name__)
+
+    def init_browser(self, headless=True):
+        """Initialisiert den Selenium-Browser"""
+        try:
+            self.logger.info(f"{Fore.CYAN}Initialisiere Browser...")
+
+            # Versuche Chrome mit automatischem ChromeDriver
+            try:
+                from selenium.webdriver.chrome.service import Service
+                from selenium.webdriver.chrome.options import Options
+
+                chrome_options = Options()
+                if headless:
+                    chrome_options.add_argument('--headless=new')
+                chrome_options.add_argument('--disable-gpu')
+                chrome_options.add_argument('--no-sandbox')
+                chrome_options.add_argument('--disable-dev-shm-usage')
+                chrome_options.add_argument('--window-size=1920,1080')
+                chrome_options.add_argument('--disable-blink-features=AutomationControlled')
+                chrome_options.add_experimental_option('excludeSwitches', ['enable-logging', 'enable-automation'])
+                chrome_options.add_experimental_option('useAutomationExtension', False)
+
+                # Versuche mit automatischem ChromeDriver Management
+                try:
+                    from selenium.webdriver.chrome.service import Service as ChromeService
+                    from webdriver_manager.chrome import ChromeDriverManager
+
+                    service = ChromeService(ChromeDriverManager().install())
+                    self.driver = webdriver.Chrome(service=service, options=chrome_options)
+                    self.logger.info(f"{Fore.GREEN}âœ“ Chrome-Browser gestartet (mit webdriver-manager)")
+                except ImportError:
+                    # Fallback: Ohne webdriver-manager
+                    self.driver = webdriver.Chrome(options=chrome_options)
+                    self.logger.info(f"{Fore.GREEN}âœ“ Chrome-Browser gestartet")
+
+                return True
+
+            except Exception as e:
+                self.logger.warning(f"{Fore.YELLOW}Chrome nicht verfÃ¼gbar: {e}")
+
+                # Versuche Firefox
+                try:
+                    from selenium.webdriver.firefox.service import Service as FirefoxService
+                    from selenium.webdriver.firefox.options import Options as FirefoxOptions
+
+                    firefox_options = FirefoxOptions()
+                    if headless:
+                        firefox_options.add_argument('--headless')
+                    firefox_options.add_argument('--disable-gpu')
+
+                    # Versuche mit automatischem GeckoDriver Management
+                    try:
+                        from webdriver_manager.firefox import GeckoDriverManager
+
+                        service = FirefoxService(GeckoDriverManager().install())
+                        self.driver = webdriver.Firefox(service=service, options=firefox_options)
+                        self.logger.info(f"{Fore.GREEN}âœ“ Firefox-Browser gestartet (mit webdriver-manager)")
+                    except ImportError:
+                        # Fallback: Ohne webdriver-manager
+                        self.driver = webdriver.Firefox(options=firefox_options)
+                        self.logger.info(f"{Fore.GREEN}âœ“ Firefox-Browser gestartet")
+
+                    return True
+
+                except Exception as e2:
+                    self.logger.error(f"{Fore.RED}Firefox nicht verfÃ¼gbar: {e2}")
+                    self.logger.error(f"{Fore.RED}Kein Browser verfÃ¼gbar!")
+                    self.logger.error(f"{Fore.YELLOW}Tipp: Installiere 'pip install webdriver-manager' fÃ¼r automatisches Driver-Management")
+                    return False
+
+        except Exception as e:
+            self.logger.error(f"{Fore.RED}Fehler beim Initialisieren des Browsers: {e}")
+            import traceback
+            self.logger.error(traceback.format_exc())
+            return False
+
+    def close_browser(self):
+        """SchlieÃŸt den Browser"""
+        if self.driver:
+            try:
+                self.driver.quit()
+                self.logger.info(f"{Fore.CYAN}Browser geschlossen")
+            except:
+                pass
+
+    def load_mission_cache(self):
+        """LÃ¤dt den Mission-Cache aus der Datei"""
+        try:
+            if os.path.exists(self.mission_cache_file):
+                with open(self.mission_cache_file, 'r', encoding='utf-8') as f:
+                    cache_data = json.load(f)
+                    self.mission_cache = cache_data.get('missions', {})
+                    self.mission_cache_age = cache_data.get('timestamp', 0)
+
+                    # PrÃ¼fe Alter des Cache (24 Stunden)
+                    cache_age_hours = (time.time() - self.mission_cache_age) / 3600
+                    if cache_age_hours > 24:
+                        self.logger.info(f"{Fore.YELLOW}Mission-Cache ist {cache_age_hours:.1f}h alt - wird aktualisiert")
+                        self.mission_cache = {}
+                    else:
+                        self.logger.info(f"{Fore.GREEN}âœ“ Mission-Cache geladen ({len(self.mission_cache)} EinsÃ¤tze, {cache_age_hours:.1f}h alt)")
+        except Exception as e:
+            self.logger.warning(f"{Fore.YELLOW}Konnte Mission-Cache nicht laden: {e}")
+            self.mission_cache = {}
+
+    def update_mission_cache(self):
+        """Aktualisiert den Mission-Cache von der API"""
+        try:
+            self.logger.info(f"{Fore.CYAN}Lade Einsatz-Datenbank von API...")
+            response = self.session.get(f'{self.base_url}/einsaetze.json')
+
+            if response.status_code == 200:
+                missions_data = response.json()
+
+                # Konvertiere zu Dictionary mit ID als Key
+                self.mission_cache = {}
+                for mission in missions_data:
+                    mission_id = str(mission.get('id', ''))
+                    self.mission_cache[mission_id] = {
+                        'name': mission.get('name', ''),
+                        'requirements': mission.get('requirements', {}),
+                        'chances': mission.get('chances', {}),
+                        'average_credits': mission.get('average_credits', 0)
+                    }
+
+                # Speichere Cache
+                cache_data = {
+                    'timestamp': time.time(),
+                    'missions': self.mission_cache
+                }
+
+                with open(self.mission_cache_file, 'w', encoding='utf-8') as f:
+                    json.dump(cache_data, f, indent=2, ensure_ascii=False)
+
+                self.mission_cache_age = time.time()
+                self.logger.info(f"{Fore.GREEN}âœ“ Mission-Cache aktualisiert ({len(self.mission_cache)} EinsÃ¤tze)")
+                return True
+            else:
+                self.logger.warning(f"{Fore.YELLOW}Konnte Mission-Cache nicht aktualisieren (Status {response.status_code})")
+                return False
+
+        except Exception as e:
+            self.logger.error(f"{Fore.RED}Fehler beim Aktualisieren des Mission-Cache: {e}")
+            return False
+    
+    def login(self):
+        """Meldet sich bei Leitstellenspiel.de an (mit Selenium)"""
+        try:
+            self.logger.info(f"{Fore.CYAN}Versuche Login...")
+
+            # Hole Account-Daten (unterstÃ¼tzt beide Formate)
+            account = None
+
+            # Neues Format: credentials
+            if 'credentials' in self.config:
+                account = self.config['credentials']
+                self.logger.info(f"{Fore.CYAN}Verwende credentials aus config")
+            # Altes Format: accounts
+            elif 'accounts' in self.config:
+                for acc in self.config.get('accounts', []):
+                    if acc.get('enabled', True):
+                        account = acc
+                        break
+                self.logger.info(f"{Fore.CYAN}Verwende accounts aus config")
+
+            if not account or not account.get('email') or not account.get('password'):
+                self.logger.error(f"{Fore.RED}Keine Login-Daten in config.json gefunden!")
+                self.logger.error(f"{Fore.YELLOW}Config: {self.config}")
+                return False
+
+            self.logger.info(f"{Fore.CYAN}Login mit: {account['email']}")
+
+            # Ã–ffne Login-Seite
+            self.driver.get(f'{self.base_url}/users/sign_in')
+            time.sleep(2)
+
+            # PrÃ¼fe ob bereits eingeloggt
+            if "Du bist bereits angemeldet" in self.driver.page_source:
+                self.logged_in = True
+                self.logger.info(f"{Fore.GREEN}âœ“ Bereits eingeloggt!")
+
+                # Aktualisiere Mission-Cache
+                if not self.mission_cache or (self.mission_cache_age and (time.time() - self.mission_cache_age) > 86400):
+                    self.update_mission_cache()
+                return True
+
+            # Finde Login-Felder
+            try:
+                self.logger.info(f"{Fore.CYAN}Suche Login-Felder...")
+                email_field = self.driver.find_element(By.ID, "user_email")
+                password_field = self.driver.find_element(By.ID, "user_password")
+
+                # FÃ¼lle Felder aus
+                self.logger.info(f"{Fore.CYAN}FÃ¼lle Login-Felder aus...")
+                email_field.clear()
+                email_field.send_keys(account['email'])
+                password_field.clear()
+                password_field.send_keys(account['password'])
+
+                # Klicke Login-Button
+                self.logger.info(f"{Fore.CYAN}Klicke Login-Button...")
+                login_button = self.driver.find_element(By.NAME, "commit")
+                login_button.click()
+
+                # Warte auf Redirect
+                self.logger.info(f"{Fore.CYAN}Warte auf Redirect...")
+                time.sleep(3)
+
+                # PrÃ¼fe ob Login erfolgreich
+                current_url = self.driver.current_url
+                self.logger.info(f"{Fore.CYAN}Aktuelle URL: {current_url}")
+
+                if 'users/sign_in' not in current_url:
+                    self.logged_in = True
+                    self.logger.info(f"{Fore.GREEN}âœ“ Login erfolgreich!")
+
+                    # Ãœbertrage Cookies von Selenium zu requests-Session
+                    self.logger.info(f"{Fore.CYAN}Ãœbertrage Session-Cookies...")
+                    selenium_cookies = self.driver.get_cookies()
+                    for cookie in selenium_cookies:
+                        self.session.cookies.set(cookie['name'], cookie['value'], domain=cookie.get('domain'))
+                    self.logger.info(f"{Fore.GREEN}âœ“ {len(selenium_cookies)} Cookies Ã¼bertragen")
+
+                    # Aktualisiere Mission-Cache
+                    if not self.mission_cache or (self.mission_cache_age and (time.time() - self.mission_cache_age) > 86400):
+                        self.update_mission_cache()
+
+                    return True
+                else:
+                    self.logger.error(f"{Fore.RED}âœ— Login fehlgeschlagen! Noch auf Login-Seite.")
+                    # PrÃ¼fe auf Fehlermeldungen
+                    if "alert" in self.driver.page_source.lower():
+                        self.logger.error(f"{Fore.RED}MÃ¶gliche Fehlermeldung auf der Seite")
+                    return False
+
+            except NoSuchElementException as e:
+                self.logger.error(f"{Fore.RED}Login-Felder nicht gefunden: {e}")
+                self.logger.error(f"{Fore.YELLOW}Aktuelle URL: {self.driver.current_url}")
+                return False
+
+        except Exception as e:
+            self.logger.error(f"{Fore.RED}Fehler beim Login: {e}")
+            import traceback
+            self.logger.error(traceback.format_exc())
+            return False
+
+    def get_api_vehicles(self, force_refresh=False):
+        """Holt alle Fahrzeuge Ã¼ber die offizielle API"""
+        try:
+            # Nutze Cache wenn vorhanden und nicht zu alt
+            if self.api_vehicles and not force_refresh:
+                return self.api_vehicles
+
+            response = self.session.get(f'{self.base_url}/api/vehicles')
+
+            if response.status_code == 200:
+                self.api_vehicles = response.json()
+                self.logger.debug(f"API: {len(self.api_vehicles)} Fahrzeuge geladen")
+                return self.api_vehicles
+            else:
+                self.logger.warning(f"API-Fehler beim Laden der Fahrzeuge: {response.status_code}")
+                return []
+
+        except Exception as e:
+            self.logger.warning(f"Fehler beim Laden der Fahrzeuge-API: {e}")
+            return []
+
+    def get_api_buildings(self, force_refresh=False):
+        """Holt alle GebÃ¤ude Ã¼ber die offizielle API"""
+        try:
+            # Nutze Cache wenn vorhanden und nicht zu alt
+            if self.api_buildings and not force_refresh:
+                return self.api_buildings
+
+            response = self.session.get(f'{self.base_url}/api/buildings')
+
+            if response.status_code == 200:
+                self.api_buildings = response.json()
+                self.logger.debug(f"API: {len(self.api_buildings)} Gebaeude geladen")
+                return self.api_buildings
+            else:
+                self.logger.warning(f"API-Fehler beim Laden der Gebaeude: {response.status_code}")
+                return []
+
+        except Exception as e:
+            self.logger.warning(f"Fehler beim Laden der Gebaeude-API: {e}")
+            return []
+
+    def get_available_vehicles_api(self):
+        """Gibt alle verfÃ¼gbaren Fahrzeuge zurÃ¼ck (Status 2 = verfÃ¼gbar)"""
+        vehicles = self.get_api_vehicles()
+        # FMS 2 = verfÃ¼gbar, 6 = auf Wache
+        available = [v for v in vehicles if v.get('fms_real') in [2, 6]]
+        return available
+
+    def get_vehicles_by_type_api(self, vehicle_type_id):
+        """Gibt alle verfÃ¼gbaren Fahrzeuge eines bestimmten Typs zurÃ¼ck"""
+        available = self.get_available_vehicles_api()
+        return [v for v in available if v.get('vehicle_type') == vehicle_type_id]
+
+    def get_missions(self):
+        """Ruft alle offenen EinsÃ¤tze ab"""
+        try:
+            self.logger.info(f"{Fore.CYAN}Rufe EinsÃ¤tze ab...")
+
+            # Hole eigene EinsÃ¤tze Ã¼ber die richtige API
+            url = f'{self.base_url}/map/mission_markers_own.js.erb'
+            self.logger.info(f"{Fore.CYAN}URL: {url}")
+
+            response = self.session.get(url)
+            self.logger.info(f"{Fore.CYAN}Status Code: {response.status_code}")
+
+            if response.status_code != 200:
+                self.logger.error(f"{Fore.RED}Fehler beim Abrufen der EinsÃ¤tze: Status {response.status_code}")
+                # PrÃ¼fe ob wir eingeloggt sind
+                if 'sign_in' in response.url:
+                    self.logger.error(f"{Fore.RED}Session abgelaufen! Bitte neu einloggen.")
+                return []
+
+            # Debug: Zeige ersten Teil der Response
+            response_preview = response.text[:200] if len(response.text) > 200 else response.text
+            self.logger.info(f"{Fore.CYAN}Response Preview: {response_preview}...")
+
+            # Extrahiere JSON aus JavaScript-Response
+            # Suche nach: const mList = [...]
+            import re
+            match = re.search(r'const mList = (\[.*?\]);', response.text, re.DOTALL)
+
+            if not match:
+                self.logger.warning(f"{Fore.YELLOW}Keine EinsÃ¤tze gefunden (mList nicht im Response)")
+                self.logger.warning(f"{Fore.YELLOW}Response LÃ¤nge: {len(response.text)} Zeichen")
+                # Speichere Response fÃ¼r Debug
+                with open(os.path.join(self.cache_dir, 'last_missions_response.txt'), 'w', encoding='utf-8') as f:
+                    f.write(response.text)
+                self.logger.info(f"{Fore.CYAN}Response gespeichert in: cache/last_missions_response.txt")
+                return []
+
+            json_str = match.group(1)
+            # Entferne trailing commas (JavaScript erlaubt sie, JSON nicht)
+            json_str = re.sub(r',(\s*[}\]])', r'\1', json_str)
+
+            import json
+            missions_data = json.loads(json_str)
+            self.logger.info(f"{Fore.CYAN}JSON geparst: {len(missions_data)} EintrÃ¤ge")
+
+            missions = []
+            for mission in missions_data:
+                missions.append({
+                    'id': mission['id'],
+                    'title': mission.get('caption', 'Unbekannt'),
+                    'address': mission.get('address', ''),
+                    'mission_type_id': mission.get('mtid'),
+                    'patients_count': mission.get('patients_count', 0),
+                    'possible_patients_count': mission.get('possible_patients_count', 0),
+                    'prisoners_count': mission.get('prisoners_count', 0),
+                    'possible_prisoners_count': mission.get('possible_prisoners_count', 0),
+                    'vehicle_state': mission.get('vehicle_state', 0),
+                    'missing_text': mission.get('missing_text'),
+                    'icon': mission.get('icon', ''),
+                    'latitude': mission.get('latitude'),
+                    'longitude': mission.get('longitude'),
+                    'created_at': mission.get('created_at'),
+                    'filter_id': mission.get('filter_id', '')
+                })
+
+            self.logger.info(f"{Fore.GREEN}âœ“ {len(missions)} eigene EinsÃ¤tze gefunden")
+
+            # Hole auch VerbandseinsÃ¤tze, falls aktiviert
+            if self.config.get('features', {}).get('alliance_mission', False):
+                alliance_missions = self.get_alliance_missions()
+                if alliance_missions:
+                    missions.extend(alliance_missions)
+                    self.logger.info(f"{Fore.GREEN}âœ“ {len(alliance_missions)} VerbandseinsÃ¤tze gefunden")
+
+            return missions
+
+        except Exception as e:
+            self.logger.error(f"{Fore.RED}Fehler beim Abrufen der EinsÃ¤tze: {e}")
+            import traceback
+            self.logger.error(traceback.format_exc())
+            return []
+
+    def get_alliance_missions(self):
+        """Ruft VerbandseinsÃ¤tze ab"""
+        try:
+            response = self.session.get(f'{self.base_url}/map/mission_markers_alliance.js.erb')
+
+            if response.status_code != 200:
+                self.logger.error(f"{Fore.RED}Fehler beim Abrufen der VerbandseinsÃ¤tze: Status {response.status_code}")
+                return []
+
+            # Extrahiere JSON aus JavaScript-Response
+            import re
+            match = re.search(r'const mList = (\[.*?\]);', response.text, re.DOTALL)
+
+            if not match:
+                # Keine VerbandseinsÃ¤tze vorhanden
+                return []
+
+            json_str = match.group(1)
+            # Entferne trailing commas
+            json_str = re.sub(r',(\s*[}\]])', r'\1', json_str)
+
+            import json
+            missions_data = json.loads(json_str)
+
+            missions = []
+            for mission in missions_data:
+                missions.append({
+                    'id': mission['id'],
+                    'title': mission.get('caption', 'Unbekannt'),
+                    'address': mission.get('address', ''),
+                    'mission_type_id': mission.get('mtid'),
+                    'patients_count': mission.get('patients_count', 0),
+                    'possible_patients_count': mission.get('possible_patients_count', 0),
+                    'prisoners_count': mission.get('prisoners_count', 0),
+                    'possible_prisoners_count': mission.get('possible_prisoners_count', 0),
+                    'vehicle_state': mission.get('vehicle_state', 0),
+                    'missing_text': mission.get('missing_text'),
+                    'icon': mission.get('icon', ''),
+                    'latitude': mission.get('latitude'),
+                    'longitude': mission.get('longitude'),
+                    'created_at': mission.get('created_at'),
+                    'filter_id': mission.get('filter_id', ''),
+                    'alliance_mission': True  # Markiere als Verbandseinsatz
+                })
+
+            return missions
+
+        except Exception as e:
+            self.logger.error(f"{Fore.RED}Fehler beim Abrufen der VerbandseinsÃ¤tze: {e}")
+            return []
+
+    def get_mission_details(self, mission_id):
+        """Ruft Details eines spezifischen Einsatzes ab"""
+        try:
+            response = self.session.get(f'{self.base_url}/missions/{mission_id}')
+            soup = BeautifulSoup(response.content, 'html.parser')
+            
+            details = {
+                'id': mission_id,
+                'vehicles_required': [],
+                'has_follow_up': False
+            }
+            
+            # PrÃ¼fe auf Nachalarmierung
+            follow_up_alert = soup.find('div', class_='alert-danger')
+            if follow_up_alert and 'Nachalarmierung' in follow_up_alert.text:
+                details['has_follow_up'] = True
+            
+            return details
+            
+        except Exception as e:
+            self.logger.error(f"{Fore.RED}Fehler beim Abrufen der Einsatzdetails {mission_id}: {e}")
+            return None
+
+    def analyze_mission_requirements(self, soup, mission_id):
+        """Analysiert die Anforderungen eines Einsatzes"""
+        try:
+            requirements = {
+                'needed': [],
+                'en_route': [],
+                'on_scene': [],
+                'missing': []
+            }
+
+            # Suche nach fehlenden Fahrzeugen (missing_text)
+            # Versuche verschiedene Selektoren
+            missing_alert = soup.find('div', class_='alert-missing-vehicles')
+            if not missing_alert:
+                # Alternative: Suche nach alert-Boxen mit "Fehlende Fahrzeuge"
+                for alert in soup.find_all('div', class_=lambda x: x and 'alert' in x):
+                    if 'Fehlende Fahrzeuge' in alert.get_text() or 'nachgefordert' in alert.get_text().lower():
+                        missing_alert = alert
+                        break
+
+            if missing_alert:
+                missing_text = missing_alert.get_text(strip=True)
+                requirements['missing'].append(missing_text)
+                self.logger.info(f"{Fore.YELLOW}Fehlende Anforderungen: {missing_text}")
+            else:
+                self.logger.info(f"{Fore.YELLOW}Fehlende Anforderungen: ")
+
+            # Suche nach Fahrzeuganforderungen
+            vehicle_requirements = soup.find_all('span', class_='building_list_vehicle_element_body_requirement')
+            for req in vehicle_requirements:
+                req_text = req.get_text(strip=True)
+                requirements['needed'].append(req_text)
+
+            # Suche nach bereits unterwegs befindlichen Fahrzeugen
+            vehicle_rows = soup.find_all('tr', class_='vehicle_select_table_tr')
+            for row in vehicle_rows:
+                # PrÃ¼fe Status des Fahrzeugs
+                status_span = row.find('span', class_='building_list_vehicle_element_body_right')
+                if status_span:
+                    status_text = status_span.get_text(strip=True)
+                    if 'unterwegs' in status_text.lower() or 'fÃ¤hrt' in status_text.lower():
+                        vehicle_name = row.find('label')
+                        if vehicle_name:
+                            requirements['en_route'].append(vehicle_name.get_text(strip=True))
+                    elif 'vor ort' in status_text.lower() or 'angekommen' in status_text.lower():
+                        vehicle_name = row.find('label')
+                        if vehicle_name:
+                            requirements['on_scene'].append(vehicle_name.get_text(strip=True))
+
+            if requirements['en_route']:
+                self.logger.info(f"{Fore.CYAN}Bereits unterwegs: {len(requirements['en_route'])} Fahrzeug(e)")
+            if requirements['on_scene']:
+                self.logger.info(f"{Fore.GREEN}Bereits vor Ort: {len(requirements['on_scene'])} Fahrzeug(e)")
+
+            return requirements
+
+        except Exception as e:
+            self.logger.error(f"{Fore.RED}Fehler bei Anforderungsanalyse: {e}")
+            return None
+
+    def handle_alert(self):
+        """Behandelt Browser-Alerts (z.B. Fahrzeug nicht verfÃ¼gbar)"""
+        try:
+            WebDriverWait(self.driver, 1).until(EC.alert_is_present())
+            alert = self.driver.switch_to.alert
+            alert_text = alert.text
+            self.logger.debug(f"Alert: {alert_text}")
+            alert.accept()
+
+            # Logge spezielle Fehler
+            if "fehl" in alert_text.lower():
+                self.logger.warning(f"{Fore.YELLOW}âš  {alert_text}")
+
+            return alert_text
+        except TimeoutException:
+            return None
+        except NoAlertPresentException:
+            return None
+
+    def dispatch_vehicles(self, mission_id, mission_title="", missing_text_from_api="", patients_count=0, possible_patients_count=0):
+        """Alarmiert Fahrzeuge fÃ¼r einen Einsatz mit Selenium"""
+        try:
+            self.logger.info(f"{Fore.CYAN}Ã–ffne Einsatz {mission_id}...")
+
+            # Ã–ffne Einsatzseite
+            self.driver.get(f'{self.base_url}/missions/{mission_id}')
+            time.sleep(2)
+
+            # PrÃ¼fe ob "Mehr Fahrzeuge laden" Button vorhanden ist
+            try:
+                load_more_button = self.driver.find_element(By.CLASS_NAME, "missing_vehicles_load")
+                self.logger.info(f"{Fore.CYAN}ðŸ”„ 'Mehr Fahrzeuge laden' Button gefunden - lade alle Fahrzeuge...")
+                # Scrolle zum Button und klicke mit JavaScript (um Ãœberlagerungen zu vermeiden)
+                self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", load_more_button)
+                time.sleep(0.5)
+                self.driver.execute_script("arguments[0].click();", load_more_button)
+                time.sleep(2)  # Warte bis Fahrzeuge geladen sind
+            except NoSuchElementException:
+                pass  # Kein Button = alle Fahrzeuge bereits geladen
+            except Exception as e:
+                self.logger.debug(f"Fehler beim Laden weiterer Fahrzeuge: {e}")
+
+            # Debug: Speichere Seite
+            page_source = self.driver.page_source
+
+            # PrÃ¼fe ob Einsatz abgeschlossen
+            if "Der Einsatz wurde erfolgreich abgeschlossen" in page_source:
+                self.logger.info(f"{Fore.GREEN}âœ“ Einsatz {mission_id} bereits abgeschlossen")
+                return True
+
+            # PrÃ¼fe ob Einsatz noch nicht begonnen hat
+            if "Beginn in:" in page_source:
+                self.logger.info(f"{Fore.YELLOW}â³ Einsatz {mission_id} hat noch nicht begonnen")
+                return False
+
+            # Debug: Zeige was auf der Seite steht
+            self.logger.info(f"{Fore.CYAN}PrÃ¼fe Einsatzstatus...")
+            has_min_needed = "Wir benÃ¶tigen noch min." in page_source
+            has_additional = "ZusÃ¤tzlich benÃ¶tigte Fahrzeuge:" in page_source
+            self.logger.info(f"{Fore.CYAN}  'Wir benÃ¶tigen noch min.': {has_min_needed}")
+            self.logger.info(f"{Fore.CYAN}  'ZusÃ¤tzlich benÃ¶tigte Fahrzeuge:': {has_additional}")
+
+            # PrÃ¼fe ob bereits Fahrzeuge vor Ort sind und nichts mehr benÃ¶tigt wird
+            if not has_min_needed and not has_additional:
+                # PrÃ¼fe ob missing_text Element existiert aber versteckt ist
+                try:
+                    missing_text_elem = self.driver.find_element(By.ID, "missing_text")
+                    style = missing_text_elem.get_attribute("style")
+                    if "display: none" in style or "display:none" in style:
+                        # missing_text versteckt - prÃ¼fe ob es Fahrzeug-Checkboxen gibt
+                        try:
+                            checkboxes = self.driver.find_elements(By.CLASS_NAME, "vehicle_checkbox")
+                            if len(checkboxes) > 0:
+                                self.logger.info(f"{Fore.YELLOW}âš  missing_text versteckt, aber {len(checkboxes)} Fahrzeuge verfÃ¼gbar")
+                                self.logger.info(f"{Fore.CYAN}ðŸ“¦ Versuche Anforderungen aus Cache zu laden...")
+                                # NICHT abbrechen - weiter unten werden die Anforderungen aus dem Cache geholt
+                            else:
+                                # Keine Checkboxen = alle Fahrzeuge sind bereits unterwegs/vor Ort
+                                self.logger.info(f"{Fore.GREEN}âœ“ Fahrzeuge unterwegs/vor Ort (missing_text versteckt, keine Checkboxen), nichts mehr benÃ¶tigt fÃ¼r Einsatz {mission_id}")
+                                return True
+                        except:
+                            pass
+                except NoSuchElementException:
+                    # Kein missing_text Element - prÃ¼fe ob Fahrzeuge vor Ort/unterwegs sind
+                    try:
+                        vehicles_at_mission = self.driver.find_element(By.ID, "mission_vehicle_at_mission")
+                        # PrÃ¼fe ob es Checkboxen gibt
+                        checkboxes = self.driver.find_elements(By.CLASS_NAME, "vehicle_checkbox")
+                        if len(checkboxes) == 0:
+                            self.logger.info(f"{Fore.GREEN}âœ“ Fahrzeuge vor Ort, keine weiteren Checkboxen, nichts mehr benÃ¶tigt fÃ¼r Einsatz {mission_id}")
+                            return True
+                        else:
+                            self.logger.info(f"{Fore.YELLOW}âš  Fahrzeuge vor Ort, aber {len(checkboxes)} Checkboxen verfÃ¼gbar - prÃ¼fe Cache")
+                    except NoSuchElementException:
+                        try:
+                            vehicles_driving = self.driver.find_element(By.ID, "mission_vehicle_driving")
+                            # PrÃ¼fe ob es Checkboxen gibt
+                            checkboxes = self.driver.find_elements(By.CLASS_NAME, "vehicle_checkbox")
+                            if len(checkboxes) == 0:
+                                self.logger.info(f"{Fore.GREEN}âœ“ Fahrzeuge unterwegs, keine weiteren Checkboxen, nichts mehr benÃ¶tigt fÃ¼r Einsatz {mission_id}")
+                                return True
+                            else:
+                                self.logger.info(f"{Fore.YELLOW}âš  Fahrzeuge unterwegs, aber {len(checkboxes)} Checkboxen verfÃ¼gbar - prÃ¼fe Cache")
+                        except NoSuchElementException:
+                            pass
+
+                # Wenn wir hier sind, gibt es keine Anforderungen auf der Seite
+                # Aber wir brechen NICHT ab - weiter unten wird aus Cache/Hilfe geladen
+                self.logger.info(f"{Fore.CYAN}Keine Anforderungen auf Seite gefunden, versuche Cache/Hilfe...")
+                # Speichere Seite fÃ¼r Debug
+                with open(os.path.join(self.cache_dir, f'mission_{mission_id}_no_requirements.html'), 'w', encoding='utf-8') as f:
+                    f.write(page_source)
+                self.logger.info(f"{Fore.CYAN}Seite gespeichert: cache/mission_{mission_id}_no_requirements.html")
+
+                # Versuche Anforderungen aus Cache/Hilfe zu laden
+                from bs4 import BeautifulSoup
+                soup = BeautifulSoup(page_source, 'html.parser')
+
+                # HÃ–CHSTE PRIORITÃ„T: missing_text aus API (das was JETZT fehlt!)
+                mission_requirements = {}
+                import re
+                if missing_text_from_api and missing_text_from_api.strip():
+                    self.logger.info(f"{Fore.CYAN}ðŸ“ Verwende missing_text aus API: {missing_text_from_api}")
+                    mission_requirements = self.parse_missing_text(missing_text_from_api)
+                    if mission_requirements:
+                        self.logger.info(f"{Fore.GREEN}âœ“ Anforderungen aus API missing_text geparst: {mission_requirements}")
+
+                # FALLBACK 1: Versuche "Wir benÃ¶tigen:" Text auf der Seite zu parsen
+                if not mission_requirements:
+                    benÃ¶tigen_match = re.search(r'Wir benÃ¶tigen:\s*(.+?)(?:\.|<|$)', page_source, re.DOTALL | re.IGNORECASE)
+                    if benÃ¶tigen_match:
+                        benÃ¶tigen_text = benÃ¶tigen_match.group(1).strip()
+                        self.logger.info(f"{Fore.CYAN}ðŸ“ Gefunden 'Wir benÃ¶tigen' auf Seite: {benÃ¶tigen_text}")
+                        mission_requirements = self.parse_missing_text(benÃ¶tigen_text)
+                        if mission_requirements:
+                            self.logger.info(f"{Fore.GREEN}âœ“ Anforderungen aus 'Wir benÃ¶tigen' geparst: {mission_requirements}")
+
+                # FALLBACK 2: Hole Mission-Type-ID aus Hilfe-Link und lade aus Cache
+                if not mission_requirements:
+                    mission_type_id = self.get_mission_type_from_help(mission_id, soup)
+                    if mission_type_id:
+                        mission_requirements = self.get_mission_requirements_from_cache(mission_type_id)
+                        if mission_requirements:
+                            self.logger.info(f"{Fore.CYAN}ðŸ“¦ Anforderungen aus Cache geladen (Type-ID: {mission_type_id}): {mission_requirements}")
+
+                # Wenn nicht im Cache, versuche Hilfe-Seite zu parsen
+                if not mission_requirements:
+                    mission_requirements = self.get_mission_requirements_from_help(mission_id, soup)
+                    if mission_requirements:
+                        self.logger.info(f"{Fore.CYAN}ðŸ“„ Anforderungen aus Hilfe-Seite geparst: {mission_requirements}")
+
+                # WICHTIG: FÃ¼ge RTW basierend auf Patientenanzahl hinzu
+                if patients_count > 0 or possible_patients_count > 0:
+                    # Verwende die tatsÃ¤chliche Patientenanzahl, falls vorhanden, sonst die mÃ¶gliche
+                    required_rtw = patients_count if patients_count > 0 else possible_patients_count
+
+                    # PrÃ¼fe ob bereits RTW in den Anforderungen sind
+                    current_rtw = mission_requirements.get('RTW', 0)
+
+                    # Wenn mehr RTW benÃ¶tigt werden als bereits gefordert, erhÃ¶he die Anzahl
+                    if required_rtw > current_rtw:
+                        mission_requirements['RTW'] = required_rtw
+                        self.logger.info(f"{Fore.CYAN}ðŸš‘ ErhÃ¶he RTW-Anforderung auf {required_rtw} (Patienten: {patients_count or possible_patients_count})")
+                    elif current_rtw > 0:
+                        self.logger.info(f"{Fore.CYAN}ðŸš‘ RTW bereits gefordert: {current_rtw} (Patienten: {patients_count or possible_patients_count})")
+
+                # Wenn wir Anforderungen haben, wÃ¤hle Fahrzeuge Ã¼ber Checkboxen aus
+                if mission_requirements:
+                    self.logger.info(f"{Fore.CYAN}WÃ¤hle Fahrzeuge Ã¼ber Checkboxen aus...")
+                    selected_count = self.select_vehicles_by_checkboxes(mission_requirements)
+                    if selected_count > 0:
+                        self.logger.info(f"{Fore.GREEN}âœ“ {selected_count} Fahrzeuge ausgewÃ¤hlt")
+                    else:
+                        self.logger.warning(f"{Fore.YELLOW}âš  Keine Fahrzeuge ausgewÃ¤hlt")
+                else:
+                    # Keine Anforderungen gefunden - prÃ¼fe nochmal ob wirklich nichts benÃ¶tigt wird
+                    checkboxes = self.driver.find_elements(By.CLASS_NAME, "vehicle_checkbox")
+                    if len(checkboxes) == 0:
+                        self.logger.info(f"{Fore.GREEN}âœ“ Keine Anforderungen und keine Checkboxen - Einsatz vollstÃ¤ndig")
+                        return True
+                    else:
+                        self.logger.warning(f"{Fore.YELLOW}âš  Keine Anforderungen gefunden, aber {len(checkboxes)} Checkboxen verfÃ¼gbar!")
+
+            # PrÃ¼fe auf "ZusÃ¤tzlich benÃ¶tigte Fahrzeuge:"
+            if "ZusÃ¤tzlich benÃ¶tigte Fahrzeuge:" in page_source:
+                self.logger.info(f"{Fore.CYAN}Nachalarmierung fÃ¼r Einsatz {mission_id}")
+
+                # Extrahiere benÃ¶tigte Fahrzeuge
+                import re
+                match = re.search(r'ZusÃ¤tzlich benÃ¶tigte Fahrzeuge:\s*(.+?)\.', page_source, re.DOTALL)
+                if match:
+                    needed_text = match.group(1)
+                    self.logger.info(f"{Fore.YELLOW}BenÃ¶tigt: {needed_text}")
+
+                    # Parse benÃ¶tigte Fahrzeuge (z.B. "1 LF, 1 RTW")
+                    vehicles_needed = []
+                    for part in needed_text.split(','):
+                        part = part.strip()
+                        # Entferne Klammern-Inhalte
+                        part = re.sub(r'\([^)]*\)', '', part).strip()
+                        if part:
+                            vehicles_needed.append(part)
+
+                    # Alarmiere benÃ¶tigte Fahrzeuge
+                    for vehicle_spec in vehicles_needed:
+                        # Format: "1 LF" oder "2 RTW"
+                        match = re.match(r'(\d+)\s+(.+)', vehicle_spec)
+                        if match:
+                            count = int(match.group(1))
+                            vehicle_type = match.group(2).strip()
+
+                            for i in range(count):
+                                try:
+                                    # Klicke auf Fahrzeug-Button
+                                    button = self.driver.find_element(By.XPATH, f'//*[@title="1 {vehicle_type}"]')
+                                    button.click()
+                                    time.sleep(0.5)
+                                    self.handle_alert()
+                                    self.logger.info(f"{Fore.GREEN}âœ“ {vehicle_type} alarmiert")
+                                except NoSuchElementException:
+                                    self.logger.warning(f"{Fore.YELLOW}âš  Button fÃ¼r {vehicle_type} nicht gefunden")
+                                except Exception as e:
+                                    self.logger.error(f"{Fore.RED}Fehler beim Alarmieren von {vehicle_type}: {e}")
+
+            # Wenn nichts Spezifisches benÃ¶tigt wird, schicke 1 Fahrzeug als Vorhut
+            elif "Wir benÃ¶tigen noch min." in page_source:
+                self.logger.info(f"{Fore.CYAN}Schicke Vorhut fÃ¼r Einsatz {mission_id}")
+
+                # Suche alle verfÃ¼gbaren Fahrzeug-Buttons
+                try:
+                    # Finde alle Buttons mit vehicle_select_table_
+                    from bs4 import BeautifulSoup
+                    soup = BeautifulSoup(page_source, 'html.parser')
+
+                    # Suche nach Fahrzeug-Buttons
+                    vehicle_buttons = soup.find_all('a', class_='btn')
+                    self.logger.info(f"{Fore.CYAN}Gefundene Buttons: {len(vehicle_buttons)}")
+
+                    # Zeige erste 5 Buttons
+                    for i, btn in enumerate(vehicle_buttons[:5]):
+                        title = btn.get('title', 'Kein Title')
+                        self.logger.info(f"{Fore.CYAN}  Button {i+1}: {title}")
+
+                except Exception as e:
+                    self.logger.error(f"{Fore.RED}Fehler beim Suchen von Buttons: {e}")
+
+                # Versuche LF zu schicken
+                try:
+                    button = self.driver.find_element(By.XPATH, '//*[@title="1 LF"]')
+                    self.logger.info(f"{Fore.CYAN}LF-Button gefunden, klicke...")
+                    button.click()
+                    time.sleep(0.5)
+                    self.handle_alert()
+                    self.logger.info(f"{Fore.GREEN}âœ“ 1 LF als Vorhut alarmiert")
+                except NoSuchElementException:
+                    self.logger.warning(f"{Fore.YELLOW}âš  LF-Button nicht gefunden, versuche RTW...")
+                    # Versuche RTW
+                    try:
+                        button = self.driver.find_element(By.XPATH, '//*[@title="1 RTW"]')
+                        self.logger.info(f"{Fore.CYAN}RTW-Button gefunden, klicke...")
+                        button.click()
+                        time.sleep(0.5)
+                        self.handle_alert()
+                        self.logger.info(f"{Fore.GREEN}âœ“ 1 RTW als Vorhut alarmiert")
+                    except NoSuchElementException:
+                        self.logger.warning(f"{Fore.YELLOW}âš  RTW-Button nicht gefunden, versuche FuStW...")
+                        # Versuche FuStW
+                        try:
+                            button = self.driver.find_element(By.XPATH, '//*[@title="1 FuStW"]')
+                            self.logger.info(f"{Fore.CYAN}FuStW-Button gefunden, klicke...")
+                            button.click()
+                            time.sleep(0.5)
+                            self.handle_alert()
+                            self.logger.info(f"{Fore.GREEN}âœ“ 1 FuStW als Vorhut alarmiert")
+                        except NoSuchElementException:
+                            self.logger.warning(f"{Fore.YELLOW}âš  Kein Fahrzeug zum Alarmieren gefunden")
+                            # Speichere Seite fÃ¼r Debug
+                            with open(os.path.join(self.cache_dir, f'mission_{mission_id}_page.html'), 'w', encoding='utf-8') as f:
+                                f.write(page_source)
+                            self.logger.info(f"{Fore.CYAN}Seite gespeichert: cache/mission_{mission_id}_page.html")
+                            return False
+                except Exception as e:
+                    self.logger.error(f"{Fore.RED}Fehler beim Klicken: {e}")
+
+            # Klicke "Alarmieren" Button
+            try:
+                self.logger.info(f"{Fore.CYAN}Suche Alarmieren-Button...")
+                commit_button = self.driver.find_element(By.NAME, "commit")
+                self.logger.info(f"{Fore.CYAN}Alarmieren-Button gefunden, klicke...")
+                self.driver.execute_script("arguments[0].click();", commit_button)
+                time.sleep(2)
+
+                # PrÃ¼fe auf Erfolgs-/Fehler-Meldung
+                try:
+                    success_alert = self.driver.find_element(By.XPATH, "//div[contains(@class, 'alert-success')]")
+                    success_text = success_alert.text
+                    self.logger.info(f"{Fore.GREEN}âœ“ {success_text}")
+                    return True
+                except NoSuchElementException:
+                    try:
+                        error_alert = self.driver.find_element(By.XPATH, "//div[contains(@class, 'alert-danger')]")
+                        error_text = error_alert.text
+                        self.logger.error(f"{Fore.RED}âœ— {error_text}")
+                        return False
+                    except NoSuchElementException:
+                        # Keine Meldung gefunden - vermutlich erfolgreich
+                        self.logger.info(f"{Fore.GREEN}âœ“ Fahrzeuge alarmiert fÃ¼r Einsatz {mission_id}")
+                        return True
+
+            except NoSuchElementException:
+                self.logger.warning(f"{Fore.YELLOW}âš  Alarmieren-Button nicht gefunden")
+                # Speichere Seite fÃ¼r Debug
+                with open(os.path.join(self.cache_dir, f'mission_{mission_id}_no_button.html'), 'w', encoding='utf-8') as f:
+                    f.write(self.driver.page_source)
+                self.logger.info(f"{Fore.CYAN}Seite gespeichert: cache/mission_{mission_id}_no_button.html")
+                return False
+
+        except Exception as e:
+            self.logger.error(f"{Fore.RED}Fehler beim Alarmieren von Fahrzeugen fÃ¼r {mission_id}: {e}")
+            return False
+
+    def select_vehicles_by_checkboxes(self, requirements):
+        """WÃ¤hlt Fahrzeuge Ã¼ber Checkboxen aus basierend auf Anforderungen"""
+        try:
+            # Mapping von internen Namen zu Checkbox-Attributen
+            # Basierend auf den tatsÃ¤chlichen HTML-Attributen
+            vehicle_type_mapping = {
+                'LF': ['lf_only', 'hlf_only', 'fire'],  # LÃ¶schfahrzeuge (fire=1 ist generisch fÃ¼r Feuerwehr)
+                'DLK': ['dlk'],  # Drehleiter
+                'RW': ['rw', 'ab_ruest_rw'],  # RÃ¼stwagen
+                'ELW': ['elw', 'kdow_elw', 'elw_or_battalion_chief_vehicle'],  # Einsatzleitwagen
+                'GW-A': ['gw_a', 'gwa'],  # Atemschutz
+                'TLF': ['tlf'],  # TanklÃ¶schfahrzeug
+                'RTW': ['rtw', 'ambulance'],  # Rettungswagen
+                'NEF': ['nef'],  # Notarzteinsatzfahrzeug
+                'KTW': ['ktw', 'patient_transport'],  # Krankentransportwagen
+                'RTH': ['rth'],  # Rettungshubschrauber
+                'FuStW': ['fustw', 'fustw_or_police_motorcycle'],  # Funkstreifenwagen
+                'GefKw': ['gefkw'],  # Gefangenenkraftwagen
+                'FwK': ['fwk'],  # Feuerwehrkran
+                'Hundestaffel': ['k9'],  # HundefÃ¼hrer
+            }
+
+            # Fallback-Mapping: Wenn Fahrzeugtyp nicht verfÃ¼gbar, verwende Alternative
+            fallback_mapping = {
+                'KTW': 'RTW',  # Wenn kein KTW verfÃ¼gbar, nimm RTW
+            }
+
+            selected_count = 0
+
+            for vehicle_type, count_needed in requirements.items():
+                # Hole alle Checkboxen
+                checkboxes = self.driver.find_elements(By.CLASS_NAME, "vehicle_checkbox")
+
+                # Finde passende Checkboxen fÃ¼r diesen Fahrzeugtyp
+                matching_checkboxes = []
+                attr_names = vehicle_type_mapping.get(vehicle_type, [vehicle_type.lower()])
+
+                for checkbox in checkboxes:
+                    # PrÃ¼fe ob Checkbox bereits ausgewÃ¤hlt ist
+                    if checkbox.is_selected():
+                        continue
+
+                    # PrÃ¼fe alle mÃ¶glichen Attributnamen
+                    for attr_name in attr_names:
+                        try:
+                            attr_value = checkbox.get_attribute(attr_name)
+                            if attr_value == "1":
+                                matching_checkboxes.append(checkbox)
+                                break
+                        except:
+                            pass
+
+                # WÃ¤hle die benÃ¶tigte Anzahl aus
+                selected_for_this_type = 0
+                for i in range(min(count_needed, len(matching_checkboxes))):
+                    try:
+                        # Scrolle zur Checkbox damit sie sichtbar ist
+                        self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", matching_checkboxes[i])
+                        time.sleep(0.2)
+
+                        # Klicke die Checkbox
+                        self.driver.execute_script("arguments[0].click();", matching_checkboxes[i])
+                        selected_count += 1
+                        selected_for_this_type += 1
+                        self.logger.info(f"{Fore.GREEN}âœ“ {vehicle_type} #{i+1} ausgewÃ¤hlt")
+                        time.sleep(0.3)
+                    except Exception as e:
+                        self.logger.warning(f"{Fore.YELLOW}âš  Fehler beim AuswÃ¤hlen von {vehicle_type}: {e}")
+
+                # Wenn nicht genug Fahrzeuge gefunden, versuche Fallback
+                if selected_for_this_type < count_needed:
+                    still_needed = count_needed - selected_for_this_type
+                    fallback_type = fallback_mapping.get(vehicle_type)
+
+                    if fallback_type:
+                        self.logger.info(f"{Fore.CYAN}Versuche Fallback: {fallback_type} statt {vehicle_type}")
+
+                        # Hole neue Checkboxen-Liste
+                        checkboxes = self.driver.find_elements(By.CLASS_NAME, "vehicle_checkbox")
+                        fallback_checkboxes = []
+                        fallback_attr_names = vehicle_type_mapping.get(fallback_type, [fallback_type.lower()])
+
+                        for checkbox in checkboxes:
+                            if checkbox.is_selected():
+                                continue
+
+                            for attr_name in fallback_attr_names:
+                                try:
+                                    attr_value = checkbox.get_attribute(attr_name)
+                                    if attr_value == "1":
+                                        fallback_checkboxes.append(checkbox)
+                                        break
+                                except:
+                                    pass
+
+                        # WÃ¤hle Fallback-Fahrzeuge
+                        for i in range(min(still_needed, len(fallback_checkboxes))):
+                            try:
+                                self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", fallback_checkboxes[i])
+                                time.sleep(0.2)
+                                self.driver.execute_script("arguments[0].click();", fallback_checkboxes[i])
+                                selected_count += 1
+                                selected_for_this_type += 1
+                                self.logger.info(f"{Fore.GREEN}âœ“ {fallback_type} #{i+1} (Fallback fÃ¼r {vehicle_type}) ausgewÃ¤hlt")
+                                time.sleep(0.3)
+                            except Exception as e:
+                                self.logger.warning(f"{Fore.YELLOW}âš  Fehler beim AuswÃ¤hlen von {fallback_type}: {e}")
+
+                    if selected_for_this_type < count_needed:
+                        self.logger.warning(f"{Fore.YELLOW}âš  Nur {selected_for_this_type}/{count_needed} {vehicle_type} verfÃ¼gbar")
+
+            return selected_count
+
+        except Exception as e:
+            self.logger.error(f"{Fore.RED}Fehler beim AuswÃ¤hlen von Fahrzeugen: {e}")
+            return 0
+
+    def get_mission_type_from_help(self, mission_id, soup):
+        """Extrahiert die Mission-Type-ID aus der Hilfe-Seite URL"""
+        try:
+            mission_help_link = soup.find('a', id='mission_help')
+            if mission_help_link:
+                help_url = mission_help_link.get('href', '')
+                # URL Format: /einsaetze/123?mission_id=456
+                # Extrahiere die 123 (mission_type_id)
+                import re
+                match = re.search(r'/einsaetze/(\d+)', help_url)
+                if match:
+                    return match.group(1)
+        except Exception as e:
+            self.logger.debug(f"Fehler beim Extrahieren der Mission-Type-ID: {e}")
+        return None
+
+    def get_mission_requirements_from_cache(self, mission_type_id):
+        """Holt die Anforderungen aus dem Cache"""
+        if not self.mission_cache:
+            return {}
+
+        mission_data = self.mission_cache.get(str(mission_type_id))
+        if not mission_data:
+            return {}
+
+        # Konvertiere API-Format zu internem Format
+        requirements = {}
+        api_reqs = mission_data.get('requirements', {})
+        api_chances = mission_data.get('chances', {})
+        mission_name = mission_data.get('name', '').lower()
+
+        # Mapping von API-Namen zu internen Namen
+        mapping = {
+            'firetrucks': 'LF',
+            'battalion_chief_vehicles': 'ELW',
+            'heavy_rescue_vehicles': 'RW',
+            'mobile_air': 'GW-A',
+            'water_tankers': 'TLF',
+            'turntable_ladder_vehicles': 'DLK',
+            'ambulances': 'RTW',
+            'fly_cars': 'NEF',
+            'mobile_command_vehicles': 'ELW',
+            'police_cars': 'FuStW',
+            'rescue_helicopters': 'RTH',
+            'patient_transport': 'KTW',
+            'fwk': 'FwK',  # Feuerwehrkran
+            'oneof_police_patrol_or_motorcycle': 'FuStW',  # Funkstreifenwagen oder Polizeimotorrad
+            'police_motorcycles': 'FuStW',  # Polizeimotorrad
+            'k9': 'Hundestaffel',  # HundefÃ¼hrer
+            'swat_armoured_vehicles': 'GefKw',  # Gefangenenkraftwagen
+        }
+
+        # Zuerst: Feste Anforderungen (requirements)
+        for api_name, internal_name in mapping.items():
+            if api_name in api_reqs:
+                count = api_reqs[api_name]
+                if count > 0:
+                    requirements[internal_name] = count
+                    # Spezialfall: patient_transport wird als KTW erkannt
+                    if api_name == 'patient_transport':
+                        self.logger.info(f"{Fore.CYAN}ðŸ“¦ Krankentransport erkannt (API) - schicke {count}x KTW")
+
+        # Wenn keine festen Anforderungen, prÃ¼fe "chances"
+        # FÃ¼r Rettungsdienst-EinsÃ¤tze: nef und patient_transport sind in "chances" definiert
+        if not requirements and api_chances:
+            # Wenn NEF mit hoher Wahrscheinlichkeit (>= 50%), schicke NEF + RTW
+            nef_chance = api_chances.get('nef', 0)
+            patient_transport_chance = api_chances.get('patient_transport', 0)
+
+            if nef_chance >= 50:
+                # Hohe NEF-Chance: Schicke NEF + RTW
+                requirements['NEF'] = 1
+                requirements['RTW'] = 1
+                self.logger.info(f"{Fore.CYAN}ðŸ“¦ Notfall erkannt (NEF-Chance: {nef_chance}%) - schicke NEF + RTW")
+            elif nef_chance > 0:
+                # Niedrige NEF-Chance: Nur RTW
+                requirements['RTW'] = 1
+                self.logger.info(f"{Fore.CYAN}ðŸ“¦ Rettungsdienst-Einsatz (NEF-Chance: {nef_chance}%) - schicke RTW")
+            elif patient_transport_chance > 0:
+                # Nur patient_transport: Krankentransport mit KTW
+                requirements['KTW'] = 1
+                self.logger.info(f"{Fore.CYAN}ðŸ“¦ Krankentransport erkannt (Chance) - schicke KTW")
+
+        # FALLBACK: Wenn immer noch keine Requirements, prÃ¼fe Einsatznamen
+        if not requirements:
+            # Krankentransport-Fallback
+            if 'krankentransport' in mission_name:
+                requirements['KTW'] = 1
+                self.logger.info(f"{Fore.CYAN}ðŸ“¦ Krankentransport erkannt (Name-Fallback) - schicke KTW")
+            # Weitere Name-basierte Fallbacks kÃ¶nnen hier hinzugefÃ¼gt werden
+            elif 'brand' in mission_name or 'feuer' in mission_name:
+                requirements['LF'] = 1
+                self.logger.info(f"{Fore.CYAN}ðŸ“¦ Feuerwehr-Einsatz erkannt (Name-Fallback) - schicke LF")
+
+        return requirements
+
+    def get_mission_requirements_from_help(self, mission_id, soup):
+        """Holt die Mindestanforderungen aus der Einsatz-Hilfe-Seite"""
+        try:
+            # Finde den Link zur Einsatz-Hilfe auf der Einsatzseite
+            mission_help_link = soup.find('a', id='mission_help')
+            if not mission_help_link:
+                self.logger.warning(f"{Fore.YELLOW}Keine Einsatz-Hilfe gefunden")
+                return {}
+
+            help_url = mission_help_link.get('href')
+            if not help_url:
+                return {}
+
+            # Hole die Hilfe-Seite
+            help_response = self.session.get(f'{self.base_url}{help_url}')
+            if help_response.status_code != 200:
+                self.logger.warning(f"{Fore.YELLOW}Konnte Einsatz-Hilfe nicht laden (Status: {help_response.status_code})")
+                return {}
+
+            help_soup = BeautifulSoup(help_response.content, 'html.parser')
+
+            import re
+            requirements = {}
+
+            # Finde den Text-Bereich
+            text_content = help_soup.get_text()
+            lines = text_content.split('\n')
+
+            # Fahrzeugtypen-Mapping (was wir suchen -> was wir zurÃ¼ckgeben)
+            vehicle_mapping = {
+                'RTW': ['Rettungswagen', 'RTW'],
+                'NEF': ['Notarzteinsatzfahrzeug', 'NEF'],
+                'KTW': ['Krankentransportwagen', 'KTW'],
+                'NAW': ['Notarztwagen', 'NAW'],
+                'RTH': ['Rettungshubschrauber', 'RTH'],
+                'ITW': ['Intensivtransportwagen', 'ITW'],
+                'LF': ['LÃ¶schfahrzeug', 'LF'],
+                'DLK': ['Drehleiter', 'DLK'],
+                'TLF': ['TanklÃ¶schfahrzeug', 'TLF'],
+                'RW': ['RÃ¼stwagen', 'RW'],
+                'GW': ['GerÃ¤tewagen', 'GW'],
+                'ELW': ['Einsatzleitwagen', 'ELW'],
+                'MTW': ['Mannschaftstransportwagen', 'MTW'],
+                'SW': ['Schlauchwagen', 'SW'],
+                'FuStW': ['Funkstreifenwagen', 'FuStW'],
+                'GefKw': ['Gefangenenkraftwagen', 'GefKw'],
+                'GW-A': ['GW-A', 'GW A'],
+                'GW-L': ['GW-L', 'GW L'],
+                'GW-Ã–l': ['GW-Ã–l', 'GW Ã–l'],
+                'GW-Mess': ['GW-Mess', 'GW Mess'],
+            }
+
+            in_requirements = False
+            for line in lines:
+                line = line.strip()
+
+                # Starte bei "Mindestanforderung"
+                if 'Mindestanforderung' in line:
+                    in_requirements = True
+                    continue
+
+                # Stoppe bei bestimmten SchlÃ¼sselwÃ¶rtern
+                if in_requirements and any(keyword in line for keyword in ['Weitere', 'Einsatzvarianten', 'Wahrscheinlichkeit', 'Voraussetzung']):
+                    break
+
+                if in_requirements and line:
+                    # Suche nach Muster: "Zahl x Fahrzeugtyp" oder "Zahl Fahrzeugtyp"
+                    match = re.match(r'^(\d+)\s*x?\s*(.+)$', line)
+                    if match:
+                        count = int(match.group(1))
+                        vehicle_desc = match.group(2).strip()
+
+                        # Bereinige Beschreibung (entferne Klammern etc.)
+                        vehicle_desc = re.sub(r'\s*\([^)]*\).*$', '', vehicle_desc)
+                        vehicle_desc = vehicle_desc.split(' oder ')[0].strip()
+
+                        # Finde passenden Fahrzeugtyp
+                        for vtype, aliases in vehicle_mapping.items():
+                            for alias in aliases:
+                                if alias.lower() in vehicle_desc.lower():
+                                    if vtype in requirements:
+                                        requirements[vtype] = max(requirements[vtype], count)
+                                    else:
+                                        requirements[vtype] = count
+                                    break
+
+            if requirements:
+                self.logger.info(f"{Fore.CYAN}Mindestanforderungen aus Hilfe-Seite:")
+                for vtype, count in requirements.items():
+                    self.logger.info(f"{Fore.CYAN}  - {count}x {vtype}")
+
+            return requirements
+
+        except Exception as e:
+            self.logger.error(f"{Fore.RED}Fehler beim Abrufen der Einsatzanforderungen: {e}")
+            import traceback
+            self.logger.error(traceback.format_exc())
+            return {}
+
+    def match_vehicle_to_requirement(self, vehicle, requirement_type):
+        """PrÃ¼ft ob ein Fahrzeug zu einer Anforderung passt"""
+        vehicle_type = vehicle.get_text(strip=True).upper()
+        requirement_type = requirement_type.upper()
+
+        # Direkte Ãœbereinstimmung
+        if requirement_type in vehicle_type or vehicle_type in requirement_type:
+            return True
+
+        # Aliase und AbkÃ¼rzungen
+        aliases = {
+            'RTW': ['RETTUNGSWAGEN', 'RTW'],
+            'NEF': ['NOTARZTEINSATZFAHRZEUG', 'NEF'],
+            'KTW': ['KRANKENTRANSPORTWAGEN', 'KTW'],
+            'LF': ['LÃ–SCHFAHRZEUG', 'LF', 'LÃ–SCHGRUPPENFAHRZEUG', 'LGF'],
+            'DLK': ['DREHLEITER', 'DLK', 'DL'],
+            'RW': ['RÃœSTWAGEN', 'RW'],
+            'GW': ['GERÃ„TEWAGEN', 'GW'],
+            'FUSTW': ['FUNKSTREIFENWAGEN', 'FUSTW'],
+            'MTW': ['MANNSCHAFTSTRANSPORTWAGEN', 'MTW'],
+            'ELW': ['EINSATZLEITWAGEN', 'ELW'],
+            'GKW': ['GERÃ„TEKRAFTWAGEN', 'GKW'],
+            'SW': ['SCHLAUCHWAGEN', 'SW'],
+            'TLF': ['TANKLÃ–SCHFAHRZEUG', 'TLF'],
+        }
+
+        for key, values in aliases.items():
+            if requirement_type in values or requirement_type == key:
+                for value in values:
+                    if value in vehicle_type:
+                        return True
+
+        return False
+
+    def parse_missing_text(self, missing_text):
+        """Parst missing_text und extrahiert Fahrzeuganforderungen"""
+        if not missing_text:
+            return {}
+
+        import re
+        requirements = {}
+
+        # Bekannte Fahrzeugtypen und ihre Patterns (mit Plural-UnterstÃ¼tzung)
+        # Pattern: Optional Zahl, dann Fahrzeugtyp (wenn keine Zahl, dann 1)
+        vehicle_patterns = {
+            'RTW': [r'(?:(\d+)\s*(?:x\s*)?\s*)?(?:Rettungswagen?|RTW)'],
+            'NEF': [r'(?:(\d+)\s*(?:x\s*)?\s*)?(?:Notarzteinsatzfahrzeuge?|NEF)'],
+            'KTW': [r'(?:(\d+)\s*(?:x\s*)?\s*)?(?:Krankentransportwagen?|KTW)'],
+            'NAW': [r'(?:(\d+)\s*(?:x\s*)?\s*)?(?:Notarztwagen?|NAW)'],
+            'RTH': [r'(?:(\d+)\s*(?:x\s*)?\s*)?(?:Rettungshubschrauber|RTH)'],
+            'ITW': [r'(?:(\d+)\s*(?:x\s*)?\s*)?(?:Intensivtransportwagen?|ITW)'],
+            'LF': [r'(?:(\d+)\s*(?:x\s*)?\s*)?(?:LÃ¶schfahrzeuge?|LF)'],
+            'DLK': [r'(?:(\d+)\s*(?:x\s*)?\s*)?(?:Drehleitern?|DLK)'],
+            'TLF': [r'(?:(\d+)\s*(?:x\s*)?\s*)?(?:TanklÃ¶schfahrzeuge?|TLF)'],
+            'RW': [r'(?:(\d+)\s*(?:x\s*)?\s*)?(?:RÃ¼stwagen?|RW)'],
+            'GW': [r'(?:(\d+)\s*(?:x\s*)?\s*)?(?:GerÃ¤tewagen?|GW)(?!\-)'],  # Nicht GW-A, GW-L etc.
+            'ELW': [r'(?:(\d+)\s*(?:x\s*)?\s*)?(?:Einsatzleitwagen?|ELW)'],
+            'MTW': [r'(?:(\d+)\s*(?:x\s*)?\s*)?(?:Mannschaftstransportwagen?|MTW)'],
+            'FuStW': [r'(?:(\d+)\s*(?:x\s*)?\s*)?(?:Funkstreifenwagen?|FuStW|Polizeimotorr.der)'],
+            'GW-A': [r'(?:(\d+)\s*(?:x\s*)?\s*)?(?:GW-A|GW\s*A)'],
+            'GW-L': [r'(?:(\d+)\s*(?:x\s*)?\s*)?(?:GW-L|GW\s*L)'],
+            'GW-Ã–l': [r'(?:(\d+)\s*(?:x\s*)?\s*)?(?:GW-Ã–l|GW\s*Ã–l)'],
+        }
+
+        for vehicle_type, patterns in vehicle_patterns.items():
+            for pattern in patterns:
+                matches = re.findall(pattern, missing_text, re.IGNORECASE)
+                if matches:
+                    # Wenn Zahl gefunden, summiere sie; wenn leer (keine Zahl), zÃ¤hle als 1
+                    count = sum(int(m) if m else 1 for m in matches)
+                    if vehicle_type in requirements:
+                        requirements[vehicle_type] = max(requirements[vehicle_type], count)
+                    else:
+                        requirements[vehicle_type] = count
+
+        return requirements
+
+    def select_vehicles_intelligently(self, available_vehicles, requirements, soup, mission_id, mission_title=""):
+        """WÃ¤hlt intelligent Fahrzeuge basierend auf Anforderungen aus"""
+        try:
+            mission_requirements = {}
+
+            # STRATEGIE 1 (PRIORITÃ„T): Parse missing_text - das ist was JETZT fehlt!
+            missing_texts = requirements.get('missing', [])
+            self.logger.debug(f"Missing texts: {missing_texts}")
+
+            for missing_text in missing_texts:
+                if missing_text:  # Nur wenn nicht leer
+                    parsed = self.parse_missing_text(missing_text)
+                    for vtype, count in parsed.items():
+                        if vtype in mission_requirements:
+                            mission_requirements[vtype] = max(mission_requirements[vtype], count)
+                        else:
+                            mission_requirements[vtype] = count
+
+            if mission_requirements:
+                self.logger.info(f"{Fore.CYAN}ðŸ” Anforderungen aus missing_text geparst: {mission_requirements}")
+
+            # STRATEGIE 2 (FALLBACK): Wenn missing_text leer, nutze Cache
+            if not mission_requirements:
+                mission_type_id = self.get_mission_type_from_help(mission_id, soup)
+                if mission_type_id:
+                    mission_requirements = self.get_mission_requirements_from_cache(mission_type_id)
+                    if mission_requirements:
+                        self.logger.info(f"{Fore.CYAN}ðŸ“¦ Anforderungen aus Cache geladen (Type-ID: {mission_type_id})")
+
+            # STRATEGIE 3 (FALLBACK): Wenn nicht im Cache, parse Hilfe-Seite
+            if not mission_requirements:
+                mission_requirements = self.get_mission_requirements_from_help(mission_id, soup)
+                if mission_requirements:
+                    self.logger.info(f"{Fore.CYAN}ðŸ“„ Anforderungen aus Hilfe-Seite geparst")
+
+            # BerÃ¼cksichtige bereits unterwegs befindliche Fahrzeuge
+            en_route_vehicles = requirements.get('en_route', [])
+            on_scene_vehicles = requirements.get('on_scene', [])
+
+            # Wenn immer noch keine Anforderungen gefunden wurden
+            if not mission_requirements:
+                # PrÃ¼fe ob bereits Fahrzeuge unterwegs sind
+                if en_route_vehicles or on_scene_vehicles:
+                    self.logger.info(f"{Fore.GREEN}Keine Anforderungen gefunden, aber Fahrzeuge bereits unterwegs/vor Ort")
+                    return []
+                else:
+                    # NEUE STRATEGIE: Schicke mindestens 1 Fahrzeug als Vorhut
+                    # Versuche anhand des Einsatznamens zu erraten, welcher Typ benÃ¶tigt wird
+                    mission_name = mission_title if mission_title else ""
+
+                    self.logger.info(f"{Fore.CYAN}ðŸ” Mission Name fÃ¼r Keyword-Erkennung: '{mission_name}'")
+
+                    # Rettungsdienst-Keywords
+                    rettungsdienst_keywords = [
+                        'sturz', 'patient', 'person', 'verletz', 'unfall', 'notfall',
+                        'bewusstlos', 'schmerz', 'atemnot', 'herzinfarkt', 'schlaganfall',
+                        'vergiftung', 'unterkÃ¼hlung', 'Ã¼berhitzung', 'krampf', 'blutung',
+                        'geburt', 'reanimation', 'ertrinken', 'erstick', 'verbrennung',
+                        'verÃ¤tzung', 'amputation', 'quetsch', 'einklemm'
+                    ]
+
+                    # Feuerwehr-Keywords
+                    feuerwehr_keywords = [
+                        'brand', 'feuer', 'rauch', 'explosion', 'gas', 'Ã¶l',
+                        'wasser', 'Ã¼berschwemmung', 'unwetter', 'baum', 'tier'
+                    ]
+
+                    # Polizei-Keywords
+                    polizei_keywords = [
+                        'randal', 'einbruch', 'diebstahl', 'raub', 'schlÃ¤gerei',
+                        'bedrohung', 'verdÃ¤chtig', 'vermisst', 'gefahr'
+                    ]
+
+                    mission_name_lower = mission_name.lower()
+
+                    if any(keyword in mission_name_lower for keyword in rettungsdienst_keywords):
+                        self.logger.info(f"{Fore.YELLOW}âš ï¸ Keine Anforderungen gefunden - schicke RTW+NEF (Rettungsdienst-Einsatz)")
+                        mission_requirements = {'RTW': 1, 'NEF': 1}
+                    elif any(keyword in mission_name_lower for keyword in polizei_keywords):
+                        self.logger.info(f"{Fore.YELLOW}âš ï¸ Keine Anforderungen gefunden - schicke FuStW (Polizei-Einsatz)")
+                        mission_requirements = {'FuStW': 1}
+                    elif any(keyword in mission_name_lower for keyword in feuerwehr_keywords):
+                        self.logger.info(f"{Fore.YELLOW}âš ï¸ Keine Anforderungen gefunden - schicke LF (Feuerwehr-Einsatz)")
+                        mission_requirements = {'LF': 1}
+                    else:
+                        # Standard: LF als Vorhut
+                        self.logger.info(f"{Fore.YELLOW}âš ï¸ Keine Anforderungen gefunden - schicke LF als Vorhut (unbekannter Typ)")
+                        mission_requirements = {'LF': 1}
+
+            # ZÃ¤hle bereits unterwegs befindliche Fahrzeuge nach Typ
+            dispatched_by_type = {}
+            for vehicle in en_route_vehicles + on_scene_vehicles:
+                vtype = vehicle.get_text(strip=True).upper()
+                # PrÃ¼fe gegen alle Anforderungen
+                for req_type in mission_requirements.keys():
+                    if req_type.upper() in vtype or vtype in req_type.upper():
+                        dispatched_by_type[req_type] = dispatched_by_type.get(req_type, 0) + 1
+                        break
+
+            # WÃ¤hle Fahrzeuge basierend auf Anforderungen
+            selected_vehicles = []
+
+            for req_type, req_count in mission_requirements.items():
+                # ZÃ¤hle bereits unterwegs befindliche Fahrzeuge dieses Typs
+                already_sent = dispatched_by_type.get(req_type, 0)
+
+                # Berechne wie viele noch benÃ¶tigt werden
+                still_needed = max(0, req_count - already_sent)
+
+                if still_needed > 0:
+                    self.logger.info(f"{Fore.CYAN}BenÃ¶tige noch {still_needed}x {req_type} (bereits {already_sent} unterwegs)")
+
+                    # Finde passende Fahrzeuge fÃ¼r diesen Typ
+                    found_for_this_type = 0
+                    for vehicle in available_vehicles:
+                        if found_for_this_type >= still_needed:
+                            break
+
+                        # PrÃ¼fe ob Fahrzeug zum Typ passt
+                        vehicle_label = vehicle.find_next('label', class_='mission_vehicle_label')
+                        if vehicle_label and self.match_vehicle_to_requirement(vehicle_label, req_type):
+                            if vehicle not in selected_vehicles:
+                                selected_vehicles.append(vehicle)
+                                found_for_this_type += 1
+                                self.logger.info(f"{Fore.GREEN}  âœ“ WÃ¤hle {vehicle_label.get_text(strip=True)}")
+
+                    # Warnung wenn nicht genug Fahrzeuge gefunden wurden
+                    if found_for_this_type < still_needed:
+                        self.logger.warning(f"{Fore.YELLOW}âš  Nur {found_for_this_type}/{still_needed} {req_type} verfÃ¼gbar!")
+                else:
+                    self.logger.info(f"{Fore.GREEN}âœ“ {req_type}: Anforderung bereits erfÃ¼llt ({already_sent}/{req_count})")
+
+            if not selected_vehicles:
+                self.logger.info(f"{Fore.GREEN}Alle Anforderungen bereits erfÃ¼llt")
+
+            return selected_vehicles
+
+        except Exception as e:
+            self.logger.error(f"{Fore.RED}Fehler bei intelligenter Fahrzeugauswahl: {e}")
+            import traceback
+            self.logger.error(traceback.format_exc())
+            return []
+
+    def handle_follow_up(self, mission_id):
+        """Behandelt Nachalarmierungen"""
+        try:
+            self.logger.info(f"{Fore.CYAN}Bearbeite Nachalarmierung fÃ¼r Einsatz {mission_id}")
+
+            # Hole Einsatzseite
+            response = self.session.get(f'{self.base_url}/missions/{mission_id}')
+            soup = BeautifulSoup(response.content, 'html.parser')
+
+            # PrÃ¼fe auf Nachalarmierungs-Button
+            follow_up_button = soup.find('a', {'class': 'btn', 'href': lambda x: x and 'alarm' in x})
+
+            if follow_up_button:
+                # Alarmiere zusÃ¤tzliche Fahrzeuge
+                return self.dispatch_vehicles(mission_id)
+
+            return False
+
+        except Exception as e:
+            self.logger.error(f"{Fore.RED}Fehler bei Nachalarmierung {mission_id}: {e}")
+            return False
+
+    def handle_radio_messages(self):
+        """Bearbeitet SprechwÃ¼nsche (Patiententransporte) mit Selenium"""
+        try:
+            self.logger.info(f"{Fore.CYAN}ðŸ” PrÃ¼fe auf SprechwÃ¼nsche...")
+
+            # Ã–ffne die Einsatzliste
+            self.driver.get(f'{self.base_url}/')
+            time.sleep(2)
+
+            # DEBUG: Speichere HTML
+            try:
+                html = self.driver.page_source
+                with open('debug_sprechwunsch.html', 'w', encoding='utf-8') as f:
+                    f.write(html)
+                self.logger.info(f"{Fore.MAGENTA}[DEBUG] HTML gespeichert: debug_sprechwunsch.html")
+            except:
+                pass
+
+            # Suche nach Sprechwunsch-Fahrzeug-Links im Funk-Panel
+            vehicle_links = []
+
+            # Die SprechwÃ¼nsche sind im Funk-Panel unter "radio_messages_important"
+            try:
+                # Finde alle Fahrzeug-Links (nicht die "Zum Einsatz" Buttons!)
+                # Format: <a href="/vehicles/XXXXX" class="btn btn-xs btn-default lightbox-open">Fahrzeugname</a>
+                vehicle_links = self.driver.find_elements(By.CSS_SELECTOR, "#radio_messages_important a[href*='/vehicles/']")
+                self.logger.info(f"{Fore.YELLOW}ðŸ“ž {len(vehicle_links)} SprechwÃ¼nsche im Funk-Panel gefunden")
+            except Exception as e:
+                self.logger.warning(f"{Fore.YELLOW}âš  Fehler beim Suchen von SprechwÃ¼nschen: {e}")
+
+            if not vehicle_links:
+                self.logger.info(f"{Fore.CYAN}âœ“ Keine SprechwÃ¼nsche gefunden")
+                return 0
+
+            self.logger.info(f"{Fore.YELLOW}ðŸ“ž Gefunden: {len(vehicle_links)} SprechwÃ¼nsche")
+
+            processed = 0
+            # Hole die Fahrzeug-URLs aus den Links
+            vehicle_urls = []
+            for link in vehicle_links[:5]:  # Max 5 pro Durchlauf
+                try:
+                    url = link.get_attribute('href')
+                    if url:
+                        vehicle_urls.append(url)
+                except:
+                    pass
+
+            # Bearbeite jeden Sprechwunsch
+            for url in vehicle_urls:
+                try:
+                    # Ã–ffne das Fahrzeug
+                    self.driver.get(url)
+                    time.sleep(2)
+
+                    # Extrahiere Fahrzeug-ID aus URL
+                    import re
+                    match = re.search(r'/vehicles/(\d+)', url)
+                    if not match:
+                        continue
+
+                    vehicle_id = match.group(1)
+                    self.logger.info(f"{Fore.CYAN}  Bearbeite Sprechwunsch (Fahrzeug {vehicle_id})...")
+
+                    # Sprechwunsch = Patient will ins Krankenhaus
+                    # Suche den ersten "Anfahren" Button (nÃ¤chstes Krankenhaus)
+                    try:
+                        # Finde alle "Anfahren" Buttons
+                        anfahren_buttons = self.driver.find_elements(By.XPATH, "//a[contains(@class, 'btn-success') and contains(text(), 'Anfahren')]")
+
+                        if anfahren_buttons:
+                            # Klicke den ersten Button (nÃ¤chstes Krankenhaus)
+                            anfahren_buttons[0].click()
+                            time.sleep(1)
+
+                            self.logger.info(f"{Fore.GREEN}âœ“ Sprechwunsch bearbeitet (Krankenhaus ausgewÃ¤hlt)")
+                            processed += 1
+                        else:
+                            self.logger.warning(f"{Fore.YELLOW}âš  Keine KrankenhÃ¤user gefunden")
+                    except Exception as e:
+                        self.logger.warning(f"{Fore.YELLOW}âš  Fehler beim AuswÃ¤hlen des Krankenhauses: {e}")
+
+                    # ZurÃ¼ck zur Hauptseite
+                    self.driver.get(f'{self.base_url}/')
+                    time.sleep(1)
+
+                except Exception as e:
+                    self.logger.warning(f"{Fore.YELLOW}âš  Fehler beim Bearbeiten eines Sprechwunsches: {e}")
+                    # ZurÃ¼ck zur Hauptseite
+                    self.driver.get(f'{self.base_url}/')
+                    time.sleep(1)
+
+            if processed > 0:
+                self.logger.info(f"{Fore.GREEN}âœ“ {processed} SprechwÃ¼nsche bearbeitet")
+
+            return processed
+
+        except Exception as e:
+            self.logger.error(f"{Fore.RED}Fehler beim Abrufen von SprechwÃ¼nschen: {e}")
+            return 0
+
+    def check_radio_messages(self):
+        """PrÃ¼ft und bearbeitet SprechwÃ¼nsche (kann nach jedem Einsatz aufgerufen werden)"""
+        try:
+            self.logger.info(f"{Fore.MAGENTA}ðŸ” PrÃ¼fe auf SprechwÃ¼nsche...")
+            self.handle_radio_messages()
+        except Exception as e:
+            self.logger.warning(f"{Fore.YELLOW}âš  Fehler beim PrÃ¼fen von SprechwÃ¼nschen: {e}")
+
+    def process_missions(self):
+        """Verarbeitet alle offenen EinsÃ¤tze"""
+        # Bearbeite SprechwÃ¼nsche vor dem Start
+        try:
+            self.logger.info(f"{Fore.MAGENTA}>>> Starte Sprechwunsch-PrÃ¼fung...")
+            self.handle_radio_messages()
+            self.logger.info(f"{Fore.MAGENTA}>>> Sprechwunsch-PrÃ¼fung abgeschlossen")
+        except Exception as e:
+            self.logger.error(f"{Fore.RED}Fehler beim Bearbeiten von SprechwÃ¼nschen: {e}")
+            import traceback
+            self.logger.error(traceback.format_exc())
+
+        missions = self.get_missions()
+
+        if not missions:
+            self.logger.info(f"{Fore.CYAN}Keine offenen EinsÃ¤tze gefunden")
+            return
+
+        self.logger.info(f"{Fore.CYAN}Gefunden: {len(missions)} offene EinsÃ¤tze")
+
+        # Filtere nur GELBE oder ROTE EinsÃ¤tze mit fehlenden Fahrzeugen
+        filtered_missions = []
+        for mission in missions:
+            icon = mission.get('icon', '')
+            missing_text_raw = mission.get('missing_text', '')
+
+            # Parse missing_text wenn es JSON/Dict ist
+            missing_text = missing_text_raw
+            if isinstance(missing_text_raw, dict):
+                missing_text = missing_text_raw.get('vehicles', '')
+            elif isinstance(missing_text_raw, str) and missing_text_raw.strip().startswith('{'):
+                try:
+                    import json
+                    missing_data = json.loads(missing_text_raw)
+                    missing_text = missing_data.get('vehicles', '')
+                except:
+                    pass
+
+            # Gelbe oder rote EinsÃ¤tze (dringend)
+            is_urgent = 'red' in icon.lower() or 'yellow' in icon.lower()
+
+            # Nur EinsÃ¤tze mit fehlenden Fahrzeugen
+            has_missing = missing_text and missing_text.strip()
+
+            if is_urgent and has_missing:
+                filtered_missions.append(mission)
+                color = "ðŸ”´" if 'red' in icon.lower() else "ðŸŸ¡"
+                self.logger.info(f"{Fore.GREEN}>>> NEUE VERSION LÃ„UFT! Fehlend: {missing_text} <<<")
+            else:
+                skip_reason = []
+                if not is_urgent:
+                    skip_reason.append("nicht dringend (gelb/rot)")
+                if not has_missing:
+                    skip_reason.append("keine fehlenden Fahrzeuge")
+                self.logger.debug(f"{Fore.YELLOW}  âŠ˜ {mission['title']} - Ãœbersprungen ({', '.join(skip_reason)})")
+
+        if not filtered_missions:
+            self.logger.info(f"{Fore.CYAN}Keine dringenden EinsÃ¤tze mit fehlenden Fahrzeugen gefunden")
+            return
+
+        self.logger.info(f"{Fore.GREEN}âœ“ {len(filtered_missions)} dringende EinsÃ¤tze mit fehlenden Fahrzeugen")
+
+        max_missions = self.config.get('bot', {}).get('max_missions_per_cycle', 10)
+        processed = 0
+
+        for mission in filtered_missions[:max_missions]:
+            if processed >= max_missions:
+                break
+
+            mission_id = mission['id']
+            mission_title = mission['title']
+            missing_text_raw = mission.get('missing_text', '')
+            patients_count = mission.get('patients_count', 0)
+            possible_patients_count = mission.get('possible_patients_count', 0)
+
+            # Parse missing_text - DIREKT hier, SOFORT!
+            missing_text = missing_text_raw
+
+            # Wenn es ein Dict ist (von der API)
+            if isinstance(missing_text_raw, dict):
+                missing_text = missing_text_raw.get('vehicles', '')
+            # Wenn es ein JSON-String ist
+            elif isinstance(missing_text_raw, str) and missing_text_raw.strip().startswith('{'):
+                try:
+                    import json
+                    missing_data = json.loads(missing_text_raw)
+                    missing_text = missing_data.get('vehicles', '')
+                except:
+                    pass
+
+            self.logger.info(f"{Fore.YELLOW}[{processed+1}/{min(len(filtered_missions), max_missions)}] {mission_title} (ID: {mission_id})")
+            self.logger.info(f"{Fore.RED}>>> VERSION 2.0 AKTIV <<<")
+            self.logger.info(f"{Fore.CYAN}  RAW: {repr(missing_text_raw)[:100]}")
+            self.logger.info(f"{Fore.GREEN}  GEPARST: {missing_text}")
+            if patients_count > 0:
+                self.logger.info(f"{Fore.CYAN}  ðŸ‘¤ Patienten: {patients_count}")
+            elif possible_patients_count > 0:
+                self.logger.info(f"{Fore.CYAN}  ðŸ‘¤ MÃ¶gliche Patienten: {possible_patients_count}")
+
+            # Hole Einsatzdetails
+            details = self.get_mission_details(mission_id)
+
+            if details:
+                # Alarmiere Fahrzeuge
+                if self.config.get('bot', {}).get('auto_dispatch', True):
+                    self.dispatch_vehicles(mission_id, mission_title, missing_text_from_api=missing_text,
+                                         patients_count=patients_count, possible_patients_count=possible_patients_count)
+                    time.sleep(self.config.get('bot', {}).get('delay_between_actions', 2))
+
+                # Behandle Nachalarmierung
+                if details['has_follow_up'] and self.config.get('bot', {}).get('auto_follow_up', True):
+                    self.handle_follow_up(mission_id)
+                    time.sleep(self.config.get('bot', {}).get('delay_between_actions', 2))
+
+                # PrÃ¼fe nach jedem Einsatz auf neue SprechwÃ¼nsche
+                self.check_radio_messages()
+
+            processed += 1
+
+        self.logger.info(f"{Fore.GREEN}âœ“ {processed} EinsÃ¤tze bearbeitet")
+
+    def run(self):
+        """Hauptschleife des Bots"""
+        print(f"{Fore.CYAN}{'='*60}")
+        print(f"{Fore.CYAN}  Leitstellenspiel.de Bot (Selenium)")
+        print(f"{Fore.CYAN}{'='*60}\n")
+
+        # Initialisiere Browser
+        headless = self.config.get('bot', {}).get('headless_browser', True)
+        if not self.init_browser(headless=headless):
+            return
+
+        try:
+            # Login
+            if not self.login():
+                self.close_browser()
+                return
+
+            print(f"\n{Fore.GREEN}Bot lÃ¤uft... (Strg+C zum Beenden)\n")
+
+            cycle = 0
+            while True:
+                cycle += 1
+                self.logger.info(f"{Fore.MAGENTA}{'='*60}")
+                self.logger.info(f"{Fore.MAGENTA}Zyklus #{cycle} - {datetime.now().strftime('%H:%M:%S')}")
+                self.logger.info(f"{Fore.MAGENTA}{'='*60}")
+
+                # Verarbeite EinsÃ¤tze
+                self.process_missions()
+
+                # Warte bis zum nÃ¤chsten Durchlauf
+                wait_time = self.config.get('bot', {}).get('check_interval', 30)
+                self.logger.info(f"{Fore.CYAN}Warte {wait_time} Sekunden bis zum nÃ¤chsten Durchlauf...\n")
+                time.sleep(wait_time)
+
+        except KeyboardInterrupt:
+            print(f"\n\n{Fore.YELLOW}Bot wird beendet...")
+            self.logger.info("Bot wurde vom Benutzer beendet")
+        except Exception as e:
+            self.logger.error(f"{Fore.RED}Unerwarteter Fehler: {e}")
+            import traceback
+            self.logger.error(traceback.format_exc())
+        finally:
+            self.close_browser()
+
+
+if __name__ == '__main__':
+    bot = LeitstellenspielBot()
+    bot.run()
+
+

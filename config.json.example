@@ -1,0 +1,48 @@
+{
+  "accounts": [
+    {
+      "name": "Mein Hauptaccount",
+      "email": "ihre-email@beispiel.de",
+      "password": "ihr-passwort",
+      "enabled": true
+    }
+  ],
+  "game": {
+    "base_url": "https://www.leitstellenspiel.de",
+    "login_url": "https://www.leitstellenspiel.de/users/sign_in",
+    "missions_url": "https://www.leitstellenspiel.de/missions",
+    "alliance_url": "https://www.leitstellenspiel.de/alliance_missions",
+    "delay_between_requests": 2,
+    "max_retries": 3,
+    "timeout": 30
+  },
+  "bot": {
+    "auto_update": true,
+    "update_check_interval": 3600,
+    "update_url": "https://raw.githubusercontent.com/IHR-USERNAME/IHR-REPO/main/version.json",
+    "check_interval": 30,
+    "auto_dispatch": true,
+    "auto_follow_up": true,
+    "max_missions_per_cycle": 10,
+    "delay_between_actions": 2
+  },
+  "features": {
+    "auto_mission": true,
+    "alliance_mission": true,
+    "auto_transport": true,
+    "auto_hospital": true,
+    "auto_prison": true,
+    "notification_sound": true
+  },
+  "limits": {
+    "max_concurrent_missions": 10,
+    "min_delay_between_missions": 5,
+    "max_delay_between_missions": 15
+  },
+  "logging": {
+    "level": "INFO",
+    "file": "bot.log",
+    "max_files": 10
+  }
+}
+

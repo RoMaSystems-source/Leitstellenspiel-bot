@@ -1,0 +1,14 @@
+{
+  "version": "1.0.0",
+  "release_date": "2026-01-05",
+  "changelog": [
+    "Initiale Version",
+    "Lizenz-System mit direkter Datenbank-Anbindung",
+    "Auto-Update Funktion",
+    "Vollständige GUI mit CustomTkinter",
+    "Multi-Account Support"
+  ],
+  "download_url": "",
+  "mandatory": false
+}
+
