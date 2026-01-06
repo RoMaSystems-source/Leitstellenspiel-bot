@@ -28,6 +28,7 @@ from selenium.webdriver.chrome.options import Options as ChromeOptions
 from selenium.webdriver.firefox.options import Options as FirefoxOptions
 import random
 from vehicle_types import VEHICLE_TYPES, CATEGORY_TO_TYPES
+from bot_standalone import LeitstellenspielBot
 
 # Colorama initialisieren
 init(autoreset=True)
