@@ -87,7 +87,10 @@ class BotGUI:
                 'max_missions': 10,
                 'headless': True,
                 'auto_dispatch': True,
-                'auto_follow_up': True
+                'auto_follow_up': True,
+                'alliance_missions': False,
+                'auto_expand': False,
+                'auto_update': True
             }
 
     def save_settings(self):
@@ -116,6 +119,9 @@ class BotGUI:
         self.settings['headless'] = self.headless_var.get()
         self.settings['auto_dispatch'] = self.auto_dispatch_var.get()
         self.settings['auto_follow_up'] = self.auto_follow_up_var.get()
+        self.settings['alliance_missions'] = self.alliance_missions_var.get()
+        self.settings['auto_expand'] = self.auto_expand_var.get()
+        self.settings['auto_update'] = self.auto_update_var.get()
 
         self.save_settings()
         self.add_log("Einstellungen gespeichert!")
@@ -367,7 +373,34 @@ class BotGUI:
             variable=self.auto_follow_up_var,
             font=ctk.CTkFont(size=14)
         )
-        self.auto_follow_up_check.pack(anchor="w", pady=(5, 20))
+        self.auto_follow_up_check.pack(anchor="w", pady=5)
+
+        self.alliance_missions_var = ctk.BooleanVar(value=self.settings.get('alliance_missions', False))
+        self.alliance_missions_check = ctk.CTkCheckBox(
+            check_frame,
+            text="Verbandseinsätze bearbeiten",
+            variable=self.alliance_missions_var,
+            font=ctk.CTkFont(size=14)
+        )
+        self.alliance_missions_check.pack(anchor="w", pady=5)
+
+        self.auto_expand_var = ctk.BooleanVar(value=self.settings.get('auto_expand', False))
+        self.auto_expand_check = ctk.CTkCheckBox(
+            check_frame,
+            text="Automatischer Gebäude-Ausbau",
+            variable=self.auto_expand_var,
+            font=ctk.CTkFont(size=14)
+        )
+        self.auto_expand_check.pack(anchor="w", pady=5)
+
+        self.auto_update_var = ctk.BooleanVar(value=self.settings.get('auto_update', True))
+        self.auto_update_check = ctk.CTkCheckBox(
+            check_frame,
+            text="Automatische Updates",
+            variable=self.auto_update_var,
+            font=ctk.CTkFont(size=14)
+        )
+        self.auto_update_check.pack(anchor="w", pady=(5, 20))
 
         # Speichern Button
         save_button = ctk.CTkButton(
@@ -482,6 +515,11 @@ class BotGUI:
                     "max_missions_per_cycle": settings.get('max_missions', 10),
                     "auto_dispatch": settings.get('auto_dispatch', True),
                     "auto_backup": settings.get('auto_backup', True)
+                },
+                "features": {
+                    "alliance_mission": settings.get('alliance_missions', False),
+                    "auto_expand": settings.get('auto_expand', False),
+                    "auto_update": settings.get('auto_update', True)
                 },
                 "logging": {
                     "level": "INFO",
