@@ -511,8 +511,8 @@ class LeitstellenspielBot:
             except:
                 pass
 
-            # Prüfe GitHub Releases (Beispiel-URL - anpassen!)
-            update_url = "https://api.github.com/repos/DEIN_USERNAME/leitstellenspiel-bot/releases/latest"
+            # Prüfe GitHub Releases
+            update_url = "https://api.github.com/repos/RoMaSystems-source/Leitstellenspiel-bot/releases/latest"
 
             response = requests.get(update_url, timeout=5)
             if response.status_code == 200:
