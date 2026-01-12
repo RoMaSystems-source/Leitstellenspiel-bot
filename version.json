@@ -1,14 +1,10 @@
 {
-  "version": "1.0.0",
-  "release_date": "2026-01-05",
+  "version": "3.7.6",
+  "release_date": "2026-01-12",
   "changelog": [
-    "Initiale Version",
-    "Lizenz-System mit direkter Datenbank-Anbindung",
-    "Auto-Update Funktion",
-    "Vollständige GUI mit CustomTkinter",
-    "Multi-Account Support"
+    "VERBESSERUNG: Lizenzprüfung alle 5 Minuten statt alle 10 Minuten für bessere Sicherheit.",
+    "VERSION: Version auf 3.7.6 erhöht."
   ],
-  "download_url": "",
+  "download_url": "https://github.com/RoMaSystems-source/Leitstellenspiel-bot/releases/latest",
   "mandatory": false
 }
-

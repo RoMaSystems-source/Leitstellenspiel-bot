@@ -1,0 +1,9 @@
+{
+  "host": "185.44.211.53",
+  "port": 3307,
+  "user": "roma",
+  "password": "112Firefighter",
+  "database": "roma_portal",
+  "charset": "utf8mb4"
+}
+

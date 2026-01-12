@@ -13,6 +13,12 @@ from datetime import datetime, timedelta
 import json
 import sys
 import os
+import warnings
+import traceback
+import re
+
+# Unterdrücke PyInstaller Temp-Ordner Warnung
+warnings.filterwarnings("ignore", message=".*Failed to remove temporary directory.*")
 
 # Bot imports
 import requests
@@ -29,6 +35,8 @@ from selenium.webdriver.firefox.options import Options as FirefoxOptions
 import random
 from vehicle_types import VEHICLE_TYPES, CATEGORY_TO_TYPES
 from bot_standalone import LeitstellenspielBot
+from license_manager import LicenseManager
+from license_dialog import LicenseDialog
 
 # Colorama initialisieren
 init(autoreset=True)
@@ -50,6 +58,10 @@ class BotGUI:
         self.root.title("Leitstellenspiel Bot - Professional Edition")
         self.root.geometry("1400x900")
 
+        # Lizenz-Manager
+        self.license_manager = LicenseManager()
+        self.license_valid = False
+
         # Bot-Instanz
         self.bot = None
         self.bot_thread = None
@@ -64,15 +76,45 @@ class BotGUI:
             'missions_processed': 0,
             'vehicles_dispatched': 0,
             'runtime': 0,
-            'credits_earned': 0
+            'credits_earned': 0,
+            'missions_success': 0,
+            'missions_failed': 0,
+            'total_processing_time': 0,  # in Sekunden
+            'missions_per_hour': []  # Liste mit Timestamps
         }
 
         # Log-Queue
         self.log_queue = queue.Queue()
 
+        # Prüfe Lizenz BEVOR UI erstellt wird
+        if not self.check_license():
+            self.root.destroy()
+            return
+
         self.setup_ui()
         self.update_log_display()
         self.update_stats_display()
+
+    def check_license(self):
+        """Prüft Lizenz beim Start"""
+        # Prüfe ob Lizenz vorhanden
+        valid, message = self.license_manager.check_license()
+
+        if valid:
+            print(f"✓ {message}")
+            self.license_valid = True
+            return True
+
+        # Zeige Lizenz-Dialog
+        dialog = LicenseDialog(self.root)
+        self.root.wait_window(dialog)
+
+        if dialog.license_valid:
+            self.license_valid = True
+            return True
+        else:
+            print("✗ Keine gültige Lizenz - Bot wird beendet")
+            return False
 
     def load_settings(self):
         """Lädt Einstellungen aus cache/settings.json oder gibt Defaults zurück"""
@@ -90,7 +132,8 @@ class BotGUI:
                 'auto_follow_up': True,
                 'alliance_missions': False,
                 'auto_expand': False,
-                'auto_update': True
+                'auto_update': True,
+                'auto_set_status6_on_fail': True
             }
 
     def save_settings(self):
@@ -122,6 +165,17 @@ class BotGUI:
         self.settings['alliance_missions'] = self.alliance_missions_var.get()
         self.settings['auto_expand'] = self.auto_expand_var.get()
         self.settings['auto_update'] = self.auto_update_var.get()
+        self.settings['auto_set_status6_on_fail'] = self.auto_status6_var.get()
+
+        # Live-Update der laufenden Bot-Config (falls Bot aktiv)
+        if self.bot:
+            try:
+                if 'bot' not in self.bot.config:
+                    self.bot.config['bot'] = {}
+                self.bot.config['bot']['auto_set_status6_on_fail'] = self.settings['auto_set_status6_on_fail']
+                self.add_log(f"Option 'Status 6 bei Personalmangel' aktualisiert: {'An' if self.settings['auto_set_status6_on_fail'] else 'Aus'}")
+            except Exception as e:
+                self.add_log(f"⚠ Konnte Bot-Config nicht live aktualisieren: {e}")
 
         self.save_settings()
         self.add_log("Einstellungen gespeichert!")
@@ -145,6 +199,22 @@ class BotGUI:
         # Entferne nach 2 Sekunden
         self.root.after(2000, notif.destroy)
 
+    def toggle_theme(self):
+        """Wechselt zwischen Dark und Light Mode"""
+        if self.theme_switch.get():
+            # Dark Mode aktiviert
+            ctk.set_appearance_mode("dark")
+            self.settings['theme_mode'] = 'dark'
+            self.show_notification("🌙 Dark Mode aktiviert")
+        else:
+            # Light Mode aktiviert
+            ctk.set_appearance_mode("light")
+            self.settings['theme_mode'] = 'light'
+            self.show_notification("☀️ Light Mode aktiviert")
+
+        # Speichere Einstellung
+        self.save_settings()
+
     def setup_ui(self):
         """Erstellt das UI"""
 
@@ -161,13 +231,60 @@ class BotGUI:
         )
         title_label.pack(side="left", padx=30, pady=20)
 
+        # Lese aktuelle Version aus version.txt
+        try:
+            # PyInstaller-kompatibel: Prüfe ob wir in einer EXE laufen
+            if getattr(sys, 'frozen', False):
+                # Wir laufen als EXE - nutze sys._MEIPASS
+                base_path = sys._MEIPASS
+            else:
+                # Wir laufen als Python-Script
+                base_path = os.path.dirname(__file__)
+
+            version_file = os.path.join(base_path, 'version.txt')
+            if os.path.exists(version_file):
+                with open(version_file, 'r') as f:
+                    current_version = f.read().strip()
+            else:
+                current_version = "3.7.0"  # Fallback
+        except:
+            current_version = "3.7.0"  # Fallback
+
         subtitle_label = ctk.CTkLabel(
             header_frame,
-            text="Professional Edition v2.0",
+            text=f"Professional Edition v{current_version}",
             font=ctk.CTkFont(size=14),
             text_color="#7f8c8d"
         )
         subtitle_label.pack(side="left", padx=10, pady=20)
+
+        # Dark/Light Mode Toggle (rechts oben)
+        theme_frame = ctk.CTkFrame(header_frame, fg_color="transparent")
+        theme_frame.pack(side="right", padx=30, pady=20)
+
+        theme_label = ctk.CTkLabel(
+            theme_frame,
+            text="🌓",
+            font=ctk.CTkFont(size=20)
+        )
+        theme_label.pack(side="left", padx=5)
+
+        self.theme_switch = ctk.CTkSwitch(
+            theme_frame,
+            text="Dark Mode",
+            command=self.toggle_theme,
+            font=ctk.CTkFont(size=12)
+        )
+        self.theme_switch.pack(side="left", padx=5)
+
+        # Lade gespeicherten Theme-Modus
+        saved_theme = self.settings.get('theme_mode', 'dark')
+        if saved_theme == 'dark':
+            self.theme_switch.select()
+            ctk.set_appearance_mode("dark")
+        else:
+            self.theme_switch.deselect()
+            ctk.set_appearance_mode("light")
 
         # Tab-System
         self.tabview = ctk.CTkTabview(self.root)
@@ -243,10 +360,13 @@ class BotGUI:
         self.stats_cards = {}
 
         stats_data = [
-            ("missions", "Einsaetze bearbeitet", "0", "#e74c3c"),
+            ("missions", "Einsätze bearbeitet", "0", "#e74c3c"),
             ("vehicles", "Fahrzeuge alarmiert", "0", "#3498db"),
             ("runtime", "Laufzeit", "00:00:00", "#9b59b6"),
-            ("credits", "Credits verdient", "0", "#f39c12")
+            ("credits", "Credits verdient", "0", "#f39c12"),
+            ("success_rate", "Erfolgsrate", "0%", "#2ecc71"),
+            ("avg_time", "Ø Zeit/Einsatz", "0s", "#e67e22"),
+            ("missions_hour", "Einsätze/Stunde", "0", "#1abc9c")
         ]
 
         for key, label, value, color in stats_data:
@@ -277,8 +397,8 @@ class BotGUI:
         """Erstellt die Einstellungen-Seite"""
         settings_tab = self.tabview.tab("Einstellungen")
 
-        # Container
-        container = ctk.CTkFrame(settings_tab, fg_color="transparent")
+        # Scrollable Container
+        container = ctk.CTkScrollableFrame(settings_tab, fg_color="transparent")
         container.pack(fill="both", expand=True, padx=50, pady=30)
 
         # Titel
@@ -400,7 +520,16 @@ class BotGUI:
             variable=self.auto_update_var,
             font=ctk.CTkFont(size=14)
         )
-        self.auto_update_check.pack(anchor="w", pady=(5, 20))
+        self.auto_update_check.pack(anchor="w", pady=5)
+
+        self.auto_status6_var = ctk.BooleanVar(value=self.settings.get('auto_set_status6_on_fail', True))
+        self.auto_status6_check = ctk.CTkCheckBox(
+            check_frame,
+            text="Status 6 bei Personalmangel setzen",
+            variable=self.auto_status6_var,
+            font=ctk.CTkFont(size=14)
+        )
+        self.auto_status6_check.pack(anchor="w", pady=(5, 20))
 
         # Speichern Button
         save_button = ctk.CTkButton(
@@ -496,9 +625,10 @@ class BotGUI:
 
     def run_bot(self):
         """Führt den Bot aus"""
+        self.add_log(">>> Bot-Thread gestartet")
         try:
             # Erstelle Bot-Instanz
-            self.add_log("Initialisiere Bot...")
+            self.add_log(">>> Erstelle Bot-Instanz...")
 
             # Lade gespeicherte Einstellungen
             settings = self.load_settings()
@@ -514,6 +644,7 @@ class BotGUI:
                     "check_interval": settings.get('check_interval', 30),
                     "max_missions_per_cycle": settings.get('max_missions', 10),
                     "auto_dispatch": settings.get('auto_dispatch', True),
+                    "auto_set_status6_on_fail": settings.get('auto_set_status6_on_fail', True),
                     "auto_backup": settings.get('auto_backup', True)
                 },
                 "features": {
@@ -532,14 +663,30 @@ class BotGUI:
             }
 
             # Speichere temporär in config.json
-            import json
-            with open('config.json', 'w', encoding='utf-8') as f:
+            self.add_log(">>> Speichere config.json...")
+
+            # Bestimme den richtigen Pfad für config.json
+            if getattr(sys, 'frozen', False):
+                # Läuft als .exe - speichere im aktuellen Verzeichnis
+                config_path = os.path.join(os.getcwd(), 'config.json')
+            else:
+                # Läuft als Python-Skript
+                config_path = 'config.json'
+
+            self.add_log(f">>> Config-Pfad: {config_path}")
+            with open(config_path, 'w', encoding='utf-8') as f:
                 json.dump(temp_config, f, indent=4, ensure_ascii=False)
 
-            self.bot = LeitstellenspielBot()
+            self.add_log(">>> Erstelle LeitstellenspielBot Instanz...")
+            try:
+                self.bot = LeitstellenspielBot(config_path=config_path)
+                self.add_log(">>> LeitstellenspielBot Instanz erstellt!")
+            except Exception as e:
+                self.add_log(f">>> FEHLER beim Erstellen der Bot-Instanz: {e}")
+                self.add_log(f">>> Traceback: {traceback.format_exc()}")
+                raise
 
             # Füge GUI-Logger-Handler hinzu
-            import logging
             class GUILogHandler(logging.Handler):
                 def __init__(self, gui_callback):
                     super().__init__()
@@ -549,32 +696,40 @@ class BotGUI:
                     try:
                         msg = self.format(record)
                         # Entferne ANSI-Farbcodes
-                        import re
                         msg = re.sub(r'\x1b\[[0-9;]*m', '', msg)
                         self.gui_callback(msg)
                     except:
                         pass
 
             gui_handler = GUILogHandler(self.add_log)
+            gui_handler.setLevel(logging.DEBUG)
             gui_handler.setFormatter(logging.Formatter('%(message)s'))
             self.bot.logger.addHandler(gui_handler)
+            self.bot.logger.setLevel(logging.DEBUG)
 
+            self.add_log(">>> GUI-Logger-Handler hinzugefügt")
             self.add_log(f"Email: {settings.get('email', 'Nicht gesetzt')}")
             self.add_log(f"Headless: {'Ja' if settings.get('headless', True) else 'Nein'}")
             self.add_log(f"Intervall: {settings.get('check_interval', 30)}s")
 
             # Initialisiere Browser
             self.add_log("Starte Browser...")
+            self.add_log(f"Headless-Modus: {settings.get('headless', True)}")
             headless = settings.get('headless', True)
 
             try:
-                if not self.bot.init_browser(headless=headless):
+                self.add_log("Rufe init_browser() auf...")
+                result = self.bot.init_browser(headless=headless)
+                result_text = "Erfolgreich" if result else "Fehlgeschlagen"
+                self.add_log(f"init_browser() Ergebnis: {result_text}")
+                if not result:
                     self.add_log("FEHLER: Browser konnte nicht gestartet werden!")
                     self.add_log("Tipp: Installiere Chrome oder Firefox")
                     self.stop_bot()
                     return
             except Exception as e:
                 self.add_log(f"FEHLER beim Browser-Start: {str(e)}")
+                self.add_log(f"Traceback: {traceback.format_exc()}")
                 self.stop_bot()
                 return
 
@@ -588,6 +743,16 @@ class BotGUI:
                     self.add_log("Prüfe Email und Passwort in den Einstellungen!")
                     self.stop_bot()
                     return
+
+                # Zusätzlicher sofortiger Lizenz-Online-Check nach Login
+                self.add_log("🔐 Sofortiger Lizenz-Check (Online) nach Login...")
+                valid, message = self.license_manager.check_license(force_online=True)
+                if not valid:
+                    self.add_log(f"✗ Lizenz ungültig: {message}")
+                    self.stop_bot()
+                    return
+                else:
+                    self.add_log(f"✓ {message}")
             except Exception as e:
                 self.add_log(f"FEHLER beim Login: {str(e)}")
                 self.stop_bot()
@@ -595,14 +760,47 @@ class BotGUI:
 
             self.add_log("Login erfolgreich!")
 
-            # Lade API-Daten
-            self.add_log("Lade Fahrzeuge und Gebaeude...")
+            # Lese aktuelle Version
             try:
-                self.bot.load_api_data()
-                self.add_log(f"Geladen: {len(self.bot.api_vehicles)} Fahrzeuge, {len(self.bot.api_buildings)} Gebaeude")
-            except Exception as e:
-                self.add_log(f"FEHLER beim Laden der API-Daten: {str(e)}")
-                # Weiter machen, auch wenn API-Daten nicht geladen werden konnten
+                # PyInstaller-kompatibel: Prüfe ob wir in einer EXE laufen
+                if getattr(sys, 'frozen', False):
+                    # Wir laufen als EXE - nutze sys._MEIPASS
+                    base_path = sys._MEIPASS
+                else:
+                    # Wir laufen als Python-Script
+                    base_path = os.path.dirname(__file__)
+
+                version_file = os.path.join(base_path, 'version.txt')
+                if os.path.exists(version_file):
+                    with open(version_file, 'r') as f:
+                        current_version = f.read().strip()
+                else:
+                    current_version = "3.7.0"  # Fallback
+            except:
+                current_version = "3.7.0"  # Fallback
+
+            self.add_log(f"✅ Version {current_version} - Auto-Update funktioniert vollständig!")
+
+            # Update-Check
+            if settings.get('auto_update', True):
+                try:
+                    self.add_log("Prüfe auf Updates...")
+                    has_update, version, release_data = self.bot.check_for_updates()
+                    if has_update:
+                        self.add_log(f"🆕 Update verfügbar: Version {version}")
+                        self.add_log("🔄 Starte automatisches Update...")
+
+                        # Führe Update durch
+                        if self.bot.auto_update(release_data):
+                            self.add_log("✓ Update erfolgreich - Bot wird neu gestartet...")
+                            # Der Bot wird automatisch neu gestartet
+                        else:
+                            self.add_log("⚠ Update fehlgeschlagen - fahre mit alter Version fort")
+                    else:
+                        self.add_log(f"✓ Bot ist aktuell (Version {version})")
+                except Exception as e:
+                    self.add_log(f"⚠ Update-Check Fehler: {e}")
+                    pass  # Ignoriere Update-Check-Fehler
 
             # Hauptschleife
             cycle = 0
@@ -611,6 +809,18 @@ class BotGUI:
                 self.add_log(f"\n=== Zyklus #{cycle} ===")
 
                 try:
+                    # Lizenz-Check alle ~5 Minuten (bei 30s Intervall: alle 10 Zyklen)
+                    if cycle % 10 == 0:
+                        self.add_log("🔐 Prüfe Lizenz (Online)...")
+                        valid, message = self.license_manager.check_license(force_online=True)
+                        if not valid:
+                            self.add_log(f"✗ Lizenz ungültig: {message}")
+                            self.add_log("⚠ Bot wird gestoppt!")
+                            self.stop_bot()
+                            break
+                        else:
+                            self.add_log(f"✓ {message}")
+
                     # SPRECHWUNSCH-PRÜFUNG VOR EINSÄTZEN
                     try:
                         self.add_log(">>> Starte Sprechwunsch-Prüfung...")
@@ -639,7 +849,22 @@ class BotGUI:
                             self.add_log(f"[{i}/{min(len(missions), max_missions)}] {title} (ID: {mission_id})")
 
                             # Prüfe ob Einsatz Fahrzeuge braucht
-                            missing_text = mission.get('missing_text')
+                            missing_text_raw = mission.get('missing_text', '')
+                            patients_count = mission.get('patients_count', 0)
+                            possible_patients_count = mission.get('possible_patients_count', 0)
+
+                            # Parse missing_text - extrahiere 'vehicles' aus JSON/Dict
+                            if isinstance(missing_text_raw, dict):
+                                missing_text = missing_text_raw.get('vehicles', '')
+                            elif isinstance(missing_text_raw, str) and missing_text_raw.strip().startswith('{'):
+                                try:
+                                    missing_data = json.loads(missing_text_raw)
+                                    missing_text = missing_data.get('vehicles', '')
+                                except:
+                                    missing_text = missing_text_raw
+                            else:
+                                missing_text = missing_text_raw
+
                             if missing_text:
                                 self.add_log(f"  Fehlend: {missing_text}")
 
@@ -652,15 +877,16 @@ class BotGUI:
                                     # Alarmiere Fahrzeuge
                                     if self.bot.config.get('bot', {}).get('auto_dispatch', True):
                                         self.add_log(f"  Alarmiere Fahrzeuge...")
-                                        self.bot.dispatch_vehicles(mission_id, title)
+                                        self.bot.dispatch_vehicles(mission_id, title, missing_text_from_api=missing_text,
+                                                                 patients_count=patients_count, possible_patients_count=possible_patients_count)
                                         self.stats['missions_processed'] += 1
-                                        time.sleep(self.bot.config.get('bot', {}).get('delay_between_actions', 2))
+                                        time.sleep(0.5)
 
                                     # Behandle Nachalarmierung
                                     if details.get('has_follow_up') and self.bot.config.get('bot', {}).get('auto_follow_up', True):
                                         self.add_log(f"  Behandle Nachalarmierung...")
                                         self.bot.handle_follow_up(mission_id)
-                                        time.sleep(self.bot.config.get('bot', {}).get('delay_between_actions', 2))
+                                        time.sleep(0.5)
 
                                     self.add_log(f"  OK Einsatz bearbeitet")
 
@@ -671,13 +897,13 @@ class BotGUI:
                                     except Exception as e:
                                         self.add_log(f"  ⚠ Fehler bei Sprechwunsch-Prüfung: {e}")
                                 else:
-                                    self.add_log(f"  SKIP Keine Details verfuegbar")
-
+                                    self.add_log(f"  ÜBERSPRINGEN: Keine Details verfügbar")
+                            
                             except Exception as e:
                                 self.add_log(f"  FEHLER: {str(e)}")
 
                             # Kurze Pause zwischen Einsätzen
-                            time.sleep(2)
+                            time.sleep(0.5)
 
                     # Warte bis zum nächsten Durchlauf
                     wait_time = self.bot.config.get('check_interval', 30)
@@ -690,13 +916,11 @@ class BotGUI:
 
                 except Exception as e:
                     self.add_log(f"FEHLER im Zyklus: {str(e)}")
-                    import traceback
                     self.add_log(traceback.format_exc())
                     time.sleep(10)
 
         except Exception as e:
             self.add_log(f"KRITISCHER FEHLER: {str(e)}")
-            import traceback
             self.add_log(traceback.format_exc())
             self.stop_bot()
         finally:
@@ -754,6 +978,38 @@ class BotGUI:
         self.stats_cards['credits'].value_label.configure(
             text=f"{self.stats['credits_earned']:,}"
         )
+
+        # Erfolgsrate
+        total_missions = self.stats['missions_success'] + self.stats['missions_failed']
+        if total_missions > 0:
+            success_rate = (self.stats['missions_success'] / total_missions) * 100
+            self.stats_cards['success_rate'].value_label.configure(
+                text=f"{success_rate:.1f}%"
+            )
+        else:
+            self.stats_cards['success_rate'].value_label.configure(text="0%")
+
+        # Durchschnittszeit pro Einsatz
+        if self.stats['missions_processed'] > 0:
+            avg_time = self.stats['total_processing_time'] / self.stats['missions_processed']
+            self.stats_cards['avg_time'].value_label.configure(
+                text=f"{avg_time:.1f}s"
+            )
+        else:
+            self.stats_cards['avg_time'].value_label.configure(text="0s")
+
+        # Einsätze pro Stunde
+        if self.start_time and self.running:
+            runtime_hours = (datetime.now() - self.start_time).total_seconds() / 3600
+            if runtime_hours > 0:
+                missions_per_hour = self.stats['missions_processed'] / runtime_hours
+                self.stats_cards['missions_hour'].value_label.configure(
+                    text=f"{missions_per_hour:.1f}"
+                )
+            else:
+                self.stats_cards['missions_hour'].value_label.configure(text="0")
+        else:
+            self.stats_cards['missions_hour'].value_label.configure(text="0")
 
         # Wiederhole alle 1000ms
         self.root.after(1000, self.update_stats_display)

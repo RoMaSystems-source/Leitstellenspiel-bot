@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 Leitstellenspiel.de Bot
@@ -1747,4 +1747,5 @@ class LeitstellenspielBot:
 if __name__ == '__main__':
     bot = LeitstellenspielBot()
     bot.run()
+
 

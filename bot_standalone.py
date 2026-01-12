@@ -82,12 +82,14 @@ class LeitstellenspielBot:
             with open(config_path, 'r', encoding='utf-8') as f:
                 return json.load(f)
         except FileNotFoundError:
-            print(f"{Fore.RED}Fehler: config.json nicht gefunden!")
+            error_msg = f"Fehler: config.json nicht gefunden unter {config_path}!"
+            print(f"{Fore.RED}{error_msg}")
             print(f"{Fore.YELLOW}Bitte kopieren Sie config.json.example zu config.json und tragen Sie Ihre Daten ein.")
-            sys.exit(1)
+            raise FileNotFoundError(error_msg)
         except json.JSONDecodeError as e:
-            print(f"{Fore.RED}Fehler beim Lesen der config.json: {e}")
-            sys.exit(1)
+            error_msg = f"Fehler beim Lesen der config.json: {e}"
+            print(f"{Fore.RED}{error_msg}")
+            raise ValueError(error_msg)
     
     def setup_logging(self):
         """Richtet das Logging-System ein"""
@@ -279,7 +281,10 @@ class LeitstellenspielBot:
 
             # Öffne Login-Seite
             self.driver.get(f'{self.base_url}/users/sign_in')
-            time.sleep(2)
+            # Warte bis Seite geladen ist (reduziert von 10s auf 3s)
+            WebDriverWait(self.driver, 3).until(
+                EC.presence_of_element_located((By.NAME, "user[email]"))
+            )
 
             # Prüfe ob bereits eingeloggt
             if "Du bist bereits angemeldet" in self.driver.page_source:
@@ -309,9 +314,11 @@ class LeitstellenspielBot:
                 login_button = self.driver.find_element(By.NAME, "commit")
                 login_button.click()
 
-                # Warte auf Redirect
+                # Warte auf Redirect (reduziert von 5s auf 2s)
                 self.logger.info(f"{Fore.CYAN}Warte auf Redirect...")
-                time.sleep(3)
+                WebDriverWait(self.driver, 2).until(
+                    lambda driver: 'users/sign_in' not in driver.current_url
+                )
 
                 # Prüfe ob Login erfolgreich
                 current_url = self.driver.current_url
@@ -396,18 +403,43 @@ class LeitstellenspielBot:
     def set_vehicle_status(self, vehicle_id, status):
         """Setzt den Status eines Fahrzeugs (6 = außer Dienst wegen Personalmangel)"""
         try:
+            # Optional via Config abschaltbar
+            if status == 6 and not self.config.get('bot', {}).get('auto_set_status6_on_fail', True):
+                self.logger.info(f"{Fore.YELLOW}⚠ auto_set_status6_on_fail=false, Status 6 wird nicht gesetzt (Fahrzeug {vehicle_id})")
+                return False
+
+            # Stelle sicher, dass die Session die aktuellen Cookies hat
+            self.logger.debug("Synchronisiere Cookies von Selenium zu requests-Session...")
+            for cookie in self.driver.get_cookies():
+                if 'domain' in cookie:
+                    self.session.cookies.set(cookie['name'], cookie['value'], domain=cookie['domain'])
+
             url = f'{self.base_url}/vehicles/{vehicle_id}/set_fms/{status}'
+            self.logger.debug(f"Setze Fahrzeug {vehicle_id} auf Status {status} via {url}")
+
             response = self.session.post(url)
 
+            self.logger.debug(f"Response Status Code: {response.status_code}")
+            self.logger.debug(f"Response Content: {response.text[:200]}")  # Erste 200 Zeichen
+
             if response.status_code == 200:
-                self.logger.debug(f"Fahrzeug {vehicle_id} auf Status {status} gesetzt")
+                # Prüfe ob Response JSON ist
+                try:
+                    json_response = response.json()
+                    self.logger.debug(f"JSON Response: {json_response}")
+                except:
+                    pass
+
+                self.logger.info(f"{Fore.GREEN}✓ Fahrzeug {vehicle_id} auf Status {status} gesetzt")
                 return True
             else:
-                self.logger.warning(f"Fehler beim Setzen des Status für Fahrzeug {vehicle_id}: {response.status_code}")
+                self.logger.warning(f"{Fore.YELLOW}⚠ Fehler beim Setzen des Status für Fahrzeug {vehicle_id}: HTTP {response.status_code}")
                 return False
 
         except Exception as e:
-            self.logger.warning(f"Fehler beim Setzen des Fahrzeugstatus: {e}")
+            self.logger.error(f"{Fore.RED}✗ Fehler beim Setzen des Fahrzeugstatus {vehicle_id}: {e}")
+            import traceback
+            self.logger.debug(traceback.format_exc())
             return False
 
     def get_credits(self):
@@ -504,9 +536,20 @@ class LeitstellenspielBot:
         """Prüft auf verfügbare Updates"""
         try:
             # Aktuelle Version aus Datei lesen
-            current_version = "2.1.0"
+            current_version = "3.7.0"
             try:
-                with open('version.txt', 'r') as f:
+                # PyInstaller-kompatibel: Prüfe ob wir in einer EXE laufen
+                import sys
+                import os
+                if getattr(sys, 'frozen', False):
+                    # Wir laufen als EXE - nutze sys._MEIPASS
+                    base_path = sys._MEIPASS
+                else:
+                    # Wir laufen als Python-Script
+                    base_path = os.path.dirname(__file__)
+
+                version_file = os.path.join(base_path, 'version.txt')
+                with open(version_file, 'r') as f:
                     current_version = f.read().strip()
             except:
                 pass
@@ -537,6 +580,13 @@ class LeitstellenspielBot:
     def auto_update(self, release_data):
         """Führt automatisches Update durch"""
         try:
+            import os
+            import sys
+            import shutil
+            import tempfile
+            import subprocess
+            import time
+
             self.logger.info(f"{Fore.CYAN}🔄 Starte automatisches Update...")
 
             # Finde die richtige Download-URL (z.B. bot_standalone.py oder .exe)
@@ -560,60 +610,176 @@ class LeitstellenspielBot:
 
             self.logger.info(f"{Fore.CYAN}Download von: {download_url}")
 
-            # Lade Update herunter
-            response = requests.get(download_url, timeout=30)
+            # Lade Update herunter (mit erhöhtem Timeout für große Dateien)
+            self.logger.info(f"{Fore.CYAN}📥 Starte Download... (kann bis zu 2 Minuten dauern)")
+            response = requests.get(download_url, timeout=120, stream=True)
             if response.status_code != 200:
                 self.logger.error(f"{Fore.RED}Download fehlgeschlagen: {response.status_code}")
                 return False
 
-            # Erstelle Backup der aktuellen Datei
-            current_file = __file__
+            # Hole Dateigröße für Fortschrittsbalken
+            total_size = int(response.headers.get('content-length', 0))
+            downloaded_size = 0
+            chunk_size = 8192  # 8 KB Chunks
+
+            # Sammle Download-Daten
+            download_data = bytearray()
+            last_progress = -1
+
+            self.logger.info(f"{Fore.CYAN}📦 Dateigröße: {total_size / 1024 / 1024:.2f} MB")
+
+            for chunk in response.iter_content(chunk_size=chunk_size):
+                if chunk:
+                    download_data.extend(chunk)
+                    downloaded_size += len(chunk)
+
+                    # Zeige Fortschritt alle 10%
+                    if total_size > 0:
+                        progress = int((downloaded_size / total_size) * 100)
+                        if progress >= last_progress + 10:
+                            last_progress = progress
+                            bar_length = 20
+                            filled = int(bar_length * progress / 100)
+                            bar = '█' * filled + '░' * (bar_length - filled)
+                            self.logger.info(f"{Fore.CYAN}📊 Download: [{bar}] {progress}% ({downloaded_size / 1024 / 1024:.2f} MB / {total_size / 1024 / 1024:.2f} MB)")
+
+            self.logger.info(f"{Fore.GREEN}✓ Download abgeschlossen!")
+
+            # Konvertiere zu bytes für weitere Verarbeitung
+            response_content = bytes(download_data)
+
+            # Bestimme die aktuelle Datei (EXE oder Python-Script)
+            if getattr(sys, 'frozen', False):
+                # Wir laufen als PyInstaller EXE
+                current_file = sys.executable
+            else:
+                # Wir laufen als Python-Script
+                current_file = __file__
+
             backup_file = current_file + '.backup'
 
+            self.logger.info(f"{Fore.CYAN}Aktuelle Datei: {current_file}")
             self.logger.info(f"{Fore.CYAN}Erstelle Backup: {backup_file}")
-            import shutil
-            shutil.copy2(current_file, backup_file)
 
-            # Speichere neue Version
-            self.logger.info(f"{Fore.CYAN}Installiere Update...")
+            try:
+                shutil.copy2(current_file, backup_file)
+            except Exception as e:
+                self.logger.warning(f"{Fore.YELLOW}Backup fehlgeschlagen: {e}")
+
+            # Speichere neue Version in temporäre Datei
+            temp_file = os.path.join(tempfile.gettempdir(), 'Leitstellenspiel-Bot-GUI-update.exe')
+
+            self.logger.info(f"{Fore.CYAN}Speichere Update in: {temp_file}")
 
             if download_url.endswith('.zip'):
                 # ZIP-Datei entpacken
                 import zipfile
                 import io
 
-                zip_file = zipfile.ZipFile(io.BytesIO(response.content))
+                zip_file = zipfile.ZipFile(io.BytesIO(response_content))
 
                 # Finde bot_standalone.py im ZIP
                 for file_name in zip_file.namelist():
-                    if 'bot_standalone.py' in file_name:
-                        with open(current_file, 'wb') as f:
+                    if 'bot_standalone.py' in file_name or 'Leitstellenspiel-Bot-GUI.exe' in file_name:
+                        with open(temp_file, 'wb') as f:
                             f.write(zip_file.read(file_name))
                         break
             else:
                 # Direkte Datei
-                with open(current_file, 'wb') as f:
-                    f.write(response.content)
+                with open(temp_file, 'wb') as f:
+                    f.write(response_content)
 
-            self.logger.info(f"{Fore.GREEN}✓ Update erfolgreich installiert!")
-            self.logger.info(f"{Fore.YELLOW}⚠ Bot wird neu gestartet...")
+            self.logger.info(f"{Fore.GREEN}✓ Update heruntergeladen!")
 
-            # Neustart
-            import sys
-            import subprocess
+            # Erstelle Update-Script das nach Beendigung ausgeführt wird
+            update_script = os.path.join(tempfile.gettempdir(), 'update_bot.bat')
 
-            # Starte neuen Prozess
-            subprocess.Popen([sys.executable] + sys.argv)
+            # Hole Prozess-ID für sicheres Warten
+            current_pid = os.getpid()
 
-            # Beende aktuellen Prozess
-            sys.exit(0)
+            with open(update_script, 'w') as f:
+                f.write('@echo off\n')
+                f.write('echo ========================================\n')
+                f.write('echo Leitstellenspiel Bot - Auto-Update\n')
+                f.write('echo ========================================\n')
+                f.write('echo.\n')
+                f.write('echo Warte auf Beendigung des Bots...\n')
+                f.write('echo.\n')
+
+                # Warte bis Prozess beendet ist (max 30 Sekunden)
+                f.write(f':WAIT_LOOP\n')
+                f.write(f'tasklist /FI "PID eq {current_pid}" 2>NUL | find /I /N "{current_pid}">NUL\n')
+                f.write(f'if "%ERRORLEVEL%"=="0" (\n')
+                f.write(f'    timeout /t 1 /nobreak >nul\n')
+                f.write(f'    goto WAIT_LOOP\n')
+                f.write(f')\n')
+                f.write('echo Bot wurde beendet!\n')
+                f.write('echo.\n')
+
+                # Zusätzliche Sicherheitspause
+                f.write('timeout /t 2 /nobreak >nul\n')
+                f.write('echo.\n')
+
+                # Ersetze alte Datei
+                f.write(f'echo Ersetze alte Datei...\n')
+                f.write(f'if exist "{current_file}.old" del /F /Q "{current_file}.old"\n')
+                f.write(f'if exist "{current_file}" (\n')
+                f.write(f'    move /Y "{current_file}" "{current_file}.old"\n')
+                f.write(f'    if errorlevel 1 (\n')
+                f.write(f'        echo FEHLER: Konnte alte Datei nicht umbenennen!\n')
+                f.write(f'        pause\n')
+                f.write(f'        exit /b 1\n')
+                f.write(f'    )\n')
+                f.write(f')\n')
+                f.write(f'move /Y "{temp_file}" "{current_file}"\n')
+                f.write(f'if errorlevel 1 (\n')
+                f.write(f'    echo FEHLER: Konnte neue Datei nicht kopieren!\n')
+                f.write(f'    echo Stelle alte Version wieder her...\n')
+                f.write(f'    move /Y "{current_file}.old" "{current_file}"\n')
+                f.write(f'    pause\n')
+                f.write(f'    exit /b 1\n')
+                f.write(f')\n')
+                f.write('echo.\n')
+                f.write(f'echo Update erfolgreich installiert!\n')
+                f.write('echo.\n')
+
+                # Lösche Backup
+                f.write(f'if exist "{current_file}.old" del /F /Q "{current_file}.old"\n')
+                f.write('echo.\n')
+
+                # Starte Bot neu
+                f.write(f'echo Starte Bot neu...\n')
+                f.write('echo.\n')
+                f.write(f'start "" "{current_file}"\n')
+                f.write('echo.\n')
+                f.write('echo Update abgeschlossen!\n')
+                f.write('timeout /t 2 /nobreak >nul\n')
+
+                # Lösche Update-Script selbst
+                f.write(f'del "%~f0"\n')
+
+            self.logger.info(f"{Fore.YELLOW}⚠ Bot wird beendet und neu gestartet...")
+            self.logger.info(f"{Fore.YELLOW}⚠ Update wird im Hintergrund installiert...")
+            self.logger.info(f"{Fore.YELLOW}⚠ Bitte warten Sie 5-10 Sekunden...")
+
+            # Starte Update-Script in sichtbarem Fenster (für Debugging)
+            subprocess.Popen(['cmd', '/c', update_script])
+
+            # Warte kurz damit das Script startet
+            time.sleep(1)
+
+            # Beende GESAMTE Anwendung (inkl. GUI) - WICHTIG: os._exit() statt sys.exit()
+            # os._exit() beendet den Prozess sofort ohne Cleanup
+            os._exit(0)
 
         except Exception as e:
             self.logger.error(f"{Fore.RED}Update fehlgeschlagen: {e}")
+            import traceback
+            self.logger.error(traceback.format_exc())
 
             # Stelle Backup wieder her
             try:
-                if os.path.exists(backup_file):
+                if 'backup_file' in locals() and os.path.exists(backup_file):
                     self.logger.info(f"{Fore.YELLOW}Stelle Backup wieder her...")
                     shutil.copy2(backup_file, current_file)
                     self.logger.info(f"{Fore.GREEN}✓ Backup wiederhergestellt")
@@ -745,6 +911,22 @@ class LeitstellenspielBot:
                 if alliance_missions:
                     missions.extend(alliance_missions)
                     self.logger.info(f"{Fore.GREEN}✓ {len(alliance_missions)} Verbandseinsätze gefunden")
+
+            # Sortiere Einsätze: Rote Einsätze zuerst (Priorität)
+            def mission_priority(mission):
+                icon = mission.get('icon', '').lower()
+                # Rote Einsätze haben höchste Priorität (0)
+                if '_rot' in icon or '_red' in icon:
+                    return 0
+                # Gelbe/normale Einsätze haben niedrigere Priorität (1)
+                return 1
+
+            missions.sort(key=mission_priority)
+
+            # Zähle rote Einsätze für Log
+            red_count = sum(1 for m in missions if mission_priority(m) == 0)
+            if red_count > 0:
+                self.logger.info(f"{Fore.RED}🔴 {red_count} ROTE Einsätze (Priorität!)")
 
             return missions
 
@@ -910,25 +1092,51 @@ class LeitstellenspielBot:
     def dispatch_vehicles(self, mission_id, mission_title="", missing_text_from_api="", patients_count=0, possible_patients_count=0):
         """Alarmiert Fahrzeuge für einen Einsatz mit Selenium"""
         try:
+            self.logger.info(f"{Fore.MAGENTA}>>> DISPATCH_VEHICLES AUFGERUFEN:")
+            self.logger.info(f"{Fore.MAGENTA}>>> mission_id = {mission_id}")
+            self.logger.info(f"{Fore.MAGENTA}>>> mission_title = '{mission_title}'")
+            self.logger.info(f"{Fore.MAGENTA}>>> missing_text_from_api = '{missing_text_from_api}' (type: {type(missing_text_from_api)})")
+            self.logger.info(f"{Fore.MAGENTA}>>> patients_count = {patients_count}")
+            self.logger.info(f"{Fore.MAGENTA}>>> possible_patients_count = {possible_patients_count}")
+
             self.logger.info(f"{Fore.CYAN}Öffne Einsatz {mission_id}...")
 
             # Öffne Einsatzseite
             self.driver.get(f'{self.base_url}/missions/{mission_id}')
-            time.sleep(2)
+            # Warte bis Seite geladen ist (statt fixer 2s)
+            WebDriverWait(self.driver, 10).until(
+                EC.presence_of_element_located((By.TAG_NAME, "body"))
+            )
 
-            # Prüfe ob "Mehr Fahrzeuge laden" Button vorhanden ist
-            try:
-                load_more_button = self.driver.find_element(By.CLASS_NAME, "missing_vehicles_load")
-                self.logger.info(f"{Fore.CYAN}🔄 'Mehr Fahrzeuge laden' Button gefunden - lade alle Fahrzeuge...")
-                # Scrolle zum Button und klicke mit JavaScript (um Überlagerungen zu vermeiden)
-                self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", load_more_button)
-                time.sleep(0.5)
-                self.driver.execute_script("arguments[0].click();", load_more_button)
-                time.sleep(2)  # Warte bis Fahrzeuge geladen sind
-            except NoSuchElementException:
-                pass  # Kein Button = alle Fahrzeuge bereits geladen
-            except Exception as e:
-                self.logger.debug(f"Fehler beim Laden weiterer Fahrzeuge: {e}")
+            # Prüfe ob "Mehr Fahrzeuge laden" Button vorhanden ist und klicke ihn, bis er verschwindet
+            max_clicks = 50  # Maximal 50x klicken (Sicherheit gegen Endlosschleife)
+            clicks = 0
+            while clicks < max_clicks:
+                try:
+                    # Finde den Button in jeder Iteration neu
+                    load_more_button = self.driver.find_element(By.CLASS_NAME, "missing_vehicles_load")
+
+                    self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", load_more_button)
+                    self.driver.execute_script("arguments[0].click();", load_more_button)
+                    clicks += 1
+
+                    # Warte, bis der Button "stale" wird (vom DOM entfernt/neu geladen)
+                    # Das ist effizienter als ein fester Sleep. (reduziert von 5s auf 2s)
+                    WebDriverWait(self.driver, 2).until(
+                        EC.staleness_of(load_more_button)
+                    )
+                except (NoSuchElementException, TimeoutException):
+                    # Button nicht gefunden oder ist nach dem Klick nicht schnell genug verschwunden -> fertig
+                    if clicks > 0:
+                        self.logger.info(f"{Fore.GREEN}✓ Alle Fahrzeuge geladen ({clicks} Klicks)")
+                    break
+                except Exception as e:
+                    self.logger.debug(f"Fehler beim Laden weiterer Fahrzeuge: {e}")
+                    break
+
+            # Warnung wenn Maximum erreicht wurde
+            if clicks >= max_clicks:
+                self.logger.warning(f"{Fore.YELLOW}⚠ Maximum von {max_clicks} Klicks erreicht - eventuell nicht alle Fahrzeuge geladen!")
 
             # Debug: Speichere Seite
             page_source = self.driver.page_source
@@ -1009,11 +1217,16 @@ class LeitstellenspielBot:
                 # HÖCHSTE PRIORITÄT: missing_text aus API (das was JETZT fehlt!)
                 mission_requirements = {}
                 import re
+                self.logger.info(f"{Fore.CYAN}>>> DEBUG: missing_text_from_api = '{missing_text_from_api}' (type: {type(missing_text_from_api)})")
                 if missing_text_from_api and missing_text_from_api.strip():
                     self.logger.info(f"{Fore.CYAN}📝 Verwende missing_text aus API: {missing_text_from_api}")
                     mission_requirements = self.parse_missing_text(missing_text_from_api)
                     if mission_requirements:
                         self.logger.info(f"{Fore.GREEN}✓ Anforderungen aus API missing_text geparst: {mission_requirements}")
+                    else:
+                        self.logger.warning(f"{Fore.YELLOW}⚠ parse_missing_text() gab leeres Dict zurück!")
+                else:
+                    self.logger.info(f"{Fore.YELLOW}>>> missing_text_from_api ist leer oder None - nutze Fallbacks")
 
                 # FALLBACK 1: Versuche "Wir benötigen:" Text auf der Seite zu parsen
                 if not mission_requirements:
@@ -1055,11 +1268,13 @@ class LeitstellenspielBot:
                         self.logger.info(f"{Fore.CYAN}🚑 RTW bereits gefordert: {current_rtw} (Patienten: {patients_count or possible_patients_count})")
 
                 # Wenn wir Anforderungen haben, wähle Fahrzeuge über Checkboxen aus
+                selected_vehicle_ids = []  # Speichere IDs für Personalmangel-Handling
                 if mission_requirements:
                     self.logger.info(f"{Fore.CYAN}Wähle Fahrzeuge über Checkboxen aus...")
                     selected_count, selected_vehicle_ids = self.select_vehicles_by_checkboxes(mission_requirements)
                     if selected_count > 0:
                         self.logger.info(f"{Fore.GREEN}✓ {selected_count} Fahrzeuge ausgewählt")
+                        self.logger.info(f"{Fore.CYAN}📋 Ausgewählte Fahrzeug-IDs: {selected_vehicle_ids}")
                     else:
                         self.logger.warning(f"{Fore.YELLOW}⚠ Keine Fahrzeuge ausgewählt")
                         selected_vehicle_ids = []
@@ -1105,7 +1320,7 @@ class LeitstellenspielBot:
                                     # Klicke auf Fahrzeug-Button
                                     button = self.driver.find_element(By.XPATH, f'//*[@title="1 {vehicle_type}"]')
                                     button.click()
-                                    time.sleep(0.5)
+                                    time.sleep(0.1)  # Reduziert von 0.5s
                                     self.handle_alert()
                                     self.logger.info(f"{Fore.GREEN}✓ {vehicle_type} alarmiert")
                                 except NoSuchElementException:
@@ -1140,7 +1355,7 @@ class LeitstellenspielBot:
                     button = self.driver.find_element(By.XPATH, '//*[@title="1 LF"]')
                     self.logger.info(f"{Fore.CYAN}LF-Button gefunden, klicke...")
                     button.click()
-                    time.sleep(0.5)
+                    time.sleep(0.05)  # Reduziert von 0.1s auf 0.05s
                     self.handle_alert()
                     self.logger.info(f"{Fore.GREEN}✓ 1 LF als Vorhut alarmiert")
                 except NoSuchElementException:
@@ -1150,7 +1365,7 @@ class LeitstellenspielBot:
                         button = self.driver.find_element(By.XPATH, '//*[@title="1 RTW"]')
                         self.logger.info(f"{Fore.CYAN}RTW-Button gefunden, klicke...")
                         button.click()
-                        time.sleep(0.5)
+                        time.sleep(0.05)  # Reduziert von 0.1s auf 0.05s
                         self.handle_alert()
                         self.logger.info(f"{Fore.GREEN}✓ 1 RTW als Vorhut alarmiert")
                     except NoSuchElementException:
@@ -1160,7 +1375,7 @@ class LeitstellenspielBot:
                             button = self.driver.find_element(By.XPATH, '//*[@title="1 FuStW"]')
                             self.logger.info(f"{Fore.CYAN}FuStW-Button gefunden, klicke...")
                             button.click()
-                            time.sleep(0.5)
+                            time.sleep(0.05)  # Reduziert von 0.1s auf 0.05s
                             self.handle_alert()
                             self.logger.info(f"{Fore.GREEN}✓ 1 FuStW als Vorhut alarmiert")
                         except NoSuchElementException:
@@ -1179,7 +1394,11 @@ class LeitstellenspielBot:
                 commit_button = self.driver.find_element(By.NAME, "commit")
                 self.logger.info(f"{Fore.CYAN}Alarmieren-Button gefunden, klicke...")
                 self.driver.execute_script("arguments[0].click();", commit_button)
-                time.sleep(2)
+
+                # Warte auf eine Erfolgs- oder Fehlermeldung
+                WebDriverWait(self.driver, 10).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, "div.alert-success, div.alert-danger"))
+                )
 
                 # Prüfe auf Erfolgs-/Fehler-Meldung
                 try:
@@ -1190,7 +1409,7 @@ class LeitstellenspielBot:
                     # Prüfe, ob Fahrzeuge wegen Personalmangel nicht alarmiert wurden
                     # Gehe zurück zur Einsatzseite und prüfe noch ausgewählte Checkboxen
                     self.driver.get(f'{self.base_url}/missions/{mission_id}')
-                    time.sleep(1)
+                    time.sleep(0.5)  # Warte bis Seite geladen ist
 
                     # Finde noch ausgewählte Checkboxen (= nicht alarmierte Fahrzeuge)
                     still_selected = self.driver.find_elements(By.CSS_SELECTOR, "input.vehicle_checkbox:checked")
@@ -1199,8 +1418,14 @@ class LeitstellenspielBot:
                         for checkbox in still_selected:
                             vehicle_id = checkbox.get_attribute("value")
                             if vehicle_id:
-                                self.logger.info(f"{Fore.CYAN}Setze Fahrzeug {vehicle_id} auf Status 6 (Personalmangel)...")
-                                self.set_vehicle_status(vehicle_id, 6)
+                                self.logger.info(f"{Fore.CYAN}🔧 Setze Fahrzeug {vehicle_id} auf Status 6 (Personalmangel)...")
+                                success = self.set_vehicle_status(vehicle_id, 6)
+                                if success:
+                                    self.logger.info(f"{Fore.GREEN}✓ Fahrzeug {vehicle_id} auf Status 6 gesetzt")
+                                else:
+                                    self.logger.warning(f"{Fore.YELLOW}⚠ Konnte Fahrzeug {vehicle_id} nicht auf Status 6 setzen")
+                    else:
+                        self.logger.info(f"{Fore.GREEN}✓ Alle ausgewählten Fahrzeuge wurden alarmiert")
 
                     return True
                 except NoSuchElementException:
@@ -1208,6 +1433,45 @@ class LeitstellenspielBot:
                         error_alert = self.driver.find_element(By.XPATH, "//div[contains(@class, 'alert-danger')]")
                         error_text = error_alert.text
                         self.logger.error(f"{Fore.RED}✗ {error_text}")
+
+                        # Prüfe ob Personalmangel-Fehler (mehr Varianten unterstützen)
+                        personnel_phrases = [
+                            "nicht genügend personal",
+                            "nicht genug personal",
+                            "fehlendes personal",
+                            "ohne personal",
+                            "nicht die richtige ausbildung",
+                            "keine passende ausbildung"
+                        ]
+                        is_personnel_issue = any(p in error_text.lower() for p in personnel_phrases)
+                        if is_personnel_issue:
+                            self.logger.warning(f"{Fore.YELLOW}⚠ Personalmangel/Ausbildungsproblem erkannt - setze Fahrzeuge auf Status 6...")
+
+                            # Gehe zurück zur Einsatzseite und prüfe noch ausgewählte Checkboxen
+                            self.driver.get(f'{self.base_url}/missions/{mission_id}')
+                            time.sleep(0.5)  # Warte bis Seite geladen ist
+
+                            # Finde noch ausgewählte Checkboxen (= nicht alarmierte Fahrzeuge)
+                            still_selected = self.driver.find_elements(By.CSS_SELECTOR, "input.vehicle_checkbox:checked")
+                            vehicles_to_set = [cb.get_attribute("value") for cb in still_selected if cb.get_attribute("value")]
+
+                            # Fallback: nutze die beim Selektieren gemerkten IDs, falls nichts mehr markiert
+                            if not vehicles_to_set and 'selected_vehicle_ids' in locals() and selected_vehicle_ids:
+                                self.logger.info(f"{Fore.YELLOW}⚠ Keine markierten Checkboxen gefunden, nutze gemerkte IDs aus Auswahl ({len(selected_vehicle_ids)})")
+                                vehicles_to_set = selected_vehicle_ids
+
+                            if vehicles_to_set:
+                                self.logger.warning(f"{Fore.YELLOW}⚠ {len(vehicles_to_set)} Fahrzeuge wurden nicht alarmiert (Personalmangel)")
+                                for vehicle_id in vehicles_to_set:
+                                    self.logger.info(f"{Fore.CYAN}🔧 Setze Fahrzeug {vehicle_id} auf Status 6 (Personalmangel)...")
+                                    success = self.set_vehicle_status(vehicle_id, 6)
+                                    if success:
+                                        self.logger.info(f"{Fore.GREEN}✓ Fahrzeug {vehicle_id} auf Status 6 gesetzt")
+                                    else:
+                                        self.logger.warning(f"{Fore.YELLOW}⚠ Konnte Fahrzeug {vehicle_id} nicht auf Status 6 setzen")
+                            else:
+                                self.logger.info(f"{Fore.YELLOW}⚠ Keine Fahrzeuge gefunden, die auf Status 6 gesetzt werden können")
+
                         return False
                     except NoSuchElementException:
                         # Keine Meldung gefunden - vermutlich erfolgreich
@@ -1245,8 +1509,13 @@ class LeitstellenspielBot:
                 'TLF': ['tlf'],  # Tanklöschfahrzeug
                 'RTW': ['rtw', 'ambulance'],  # Rettungswagen
                 'NEF': ['nef'],  # Notarzteinsatzfahrzeug
+                'NAW': ['naw'],  # Notarztwagen
                 'KTW': ['ktw', 'patient_transport'],  # Krankentransportwagen
                 'RTH': ['rth'],  # Rettungshubschrauber
+                'LNA': ['kdow_lna', 'lna'],  # Leitender Notarzt
+                'ORGL': ['kdow_orgl', 'orgl'],  # Organisatorischer Leiter
+                'KdoW-LNA': ['kdow_lna'],  # KdoW Leitender Notarzt
+                'KdoW-ORGL': ['kdow_orgl'],  # KdoW Organisatorischer Leiter
                 'FuStW': ['fustw', 'fustw_or_police_motorcycle'],  # Funkstreifenwagen
                 'GefKw': ['gefkw'],  # Gefangenenkraftwagen
                 'FwK': ['fwk'],  # Feuerwehrkran
@@ -1321,7 +1590,7 @@ class LeitstellenspielBot:
 
                                         # Scrolle zur Checkbox damit sie sichtbar ist
                                         self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", checkbox)
-                                        time.sleep(0.2)
+                                        time.sleep(0.02)  # Reduziert von 0.05s auf 0.02s
 
                                         # Klicke die Checkbox
                                         self.driver.execute_script("arguments[0].click();", checkbox)
@@ -1329,7 +1598,7 @@ class LeitstellenspielBot:
                                         selected_for_this_type += 1
                                         selected_vehicle_ids.append(vehicle_id)  # Speichere ID
                                         self.logger.info(f"{Fore.GREEN}✓ {vehicle_type} #{selected_for_this_type} ausgewählt (ID: {vehicle_id})")
-                                        time.sleep(0.5)  # Warte länger nach Klick
+                                        time.sleep(0.05)  # Reduziert von 0.1s auf 0.05s
                                         found = True
                                         break
                                 except:
@@ -1383,12 +1652,12 @@ class LeitstellenspielBot:
                         for i in range(min(still_needed, len(fallback_checkboxes))):
                             try:
                                 self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", fallback_checkboxes[i])
-                                time.sleep(0.2)
+                                time.sleep(0.05)  # Reduziert von 0.2s
                                 self.driver.execute_script("arguments[0].click();", fallback_checkboxes[i])
                                 selected_count += 1
                                 selected_for_this_type += 1
                                 self.logger.info(f"{Fore.GREEN}✓ {fallback_type} #{i+1} (Fallback für {vehicle_type}) ausgewählt")
-                                time.sleep(0.3)
+                                time.sleep(0.1)  # Reduziert von 0.3s
                             except Exception as e:
                                 self.logger.warning(f"{Fore.YELLOW}⚠ Fehler beim Auswählen von {fallback_type}: {e}")
 
@@ -1631,45 +1900,46 @@ class LeitstellenspielBot:
         return False
 
     def parse_missing_text(self, missing_text):
-        """Parst missing_text und extrahiert Fahrzeuganforderungen"""
+        """Parst missing_text und extrahiert Fahrzeuganforderungen (optimiert)"""
         if not missing_text:
             return {}
 
         import re
         requirements = {}
 
-        # Bekannte Fahrzeugtypen und ihre Patterns (mit Plural-Unterstützung)
-        # Pattern: Optional Zahl, dann Fahrzeugtyp (wenn keine Zahl, dann 1)
-        vehicle_patterns = {
-            'RTW': [r'(?:(\d+)\s*(?:x\s*)?\s*)?(?:Rettungswagen?|RTW)'],
-            'NEF': [r'(?:(\d+)\s*(?:x\s*)?\s*)?(?:Notarzteinsatzfahrzeuge?|NEF)'],
-            'KTW': [r'(?:(\d+)\s*(?:x\s*)?\s*)?(?:Krankentransportwagen?|KTW)'],
-            'NAW': [r'(?:(\d+)\s*(?:x\s*)?\s*)?(?:Notarztwagen?|NAW)'],
-            'RTH': [r'(?:(\d+)\s*(?:x\s*)?\s*)?(?:Rettungshubschrauber|RTH)'],
-            'ITW': [r'(?:(\d+)\s*(?:x\s*)?\s*)?(?:Intensivtransportwagen?|ITW)'],
-            'LF': [r'(?:(\d+)\s*(?:x\s*)?\s*)?(?:Löschfahrzeuge?|LF)'],
-            'DLK': [r'(?:(\d+)\s*(?:x\s*)?\s*)?(?:Drehleitern?|DLK)'],
-            'TLF': [r'(?:(\d+)\s*(?:x\s*)?\s*)?(?:Tanklöschfahrzeuge?|TLF)'],
-            'RW': [r'(?:(\d+)\s*(?:x\s*)?\s*)?(?:Rüstwagen?|RW)'],
-            'GW': [r'(?:(\d+)\s*(?:x\s*)?\s*)?(?:Gerätewagen?|GW)(?!\-)'],  # Nicht GW-A, GW-L etc.
-            'ELW': [r'(?:(\d+)\s*(?:x\s*)?\s*)?(?:Einsatzleitwagen?|ELW)'],
-            'MTW': [r'(?:(\d+)\s*(?:x\s*)?\s*)?(?:Mannschaftstransportwagen?|MTW)'],
-            'FuStW': [r'(?:(\d+)\s*(?:x\s*)?\s*)?(?:Funkstreifenwagen?|FuStW|Polizeimotorr.der)'],
-            'GW-A': [r'(?:(\d+)\s*(?:x\s*)?\s*)?(?:GW-A|GW\s*A)'],
-            'GW-L': [r'(?:(\d+)\s*(?:x\s*)?\s*)?(?:GW-L|GW\s*L)'],
-            'GW-Öl': [r'(?:(\d+)\s*(?:x\s*)?\s*)?(?:GW-Öl|GW\s*Öl)'],
-        }
+        # Optimierte Patterns: Einzelnes kompiliertes Regex pro Fahrzeugtyp
+        # Format: (pattern, vehicle_type)
+        vehicle_patterns = [
+            (re.compile(r'(\d+)\s*x?\s*Rettungswagen|RTW', re.IGNORECASE), 'RTW'),
+            (re.compile(r'(\d+)\s*x?\s*Notarzteinsatzfahrzeug|NEF', re.IGNORECASE), 'NEF'),
+            (re.compile(r'(\d+)\s*x?\s*Notarztwagen|NAW', re.IGNORECASE), 'NAW'),
+            (re.compile(r'(\d+)\s*x?\s*Krankentransportwagen|KTW', re.IGNORECASE), 'KTW'),
+            (re.compile(r'(\d+)\s*x?\s*Rettungshubschrauber|RTH', re.IGNORECASE), 'RTH'),
+            (re.compile(r'(\d+)\s*x?\s*Intensivtransportwagen|ITW', re.IGNORECASE), 'ITW'),
+            (re.compile(r'(\d+)\s*x?\s*Leitender\s+Notarzt|LNA', re.IGNORECASE), 'LNA'),
+            (re.compile(r'(\d+)\s*x?\s*Organisatorischer\s+Leiter|OrgL|ORGL', re.IGNORECASE), 'ORGL'),
+            (re.compile(r'(\d+)\s*x?\s*KdoW-LNA|KdoW\s*LNA', re.IGNORECASE), 'KdoW-LNA'),
+            (re.compile(r'(\d+)\s*x?\s*KdoW-OrgL|KdoW\s*OrgL', re.IGNORECASE), 'KdoW-ORGL'),
+            (re.compile(r'(\d+)\s*x?\s*Löschfahrzeug|LF', re.IGNORECASE), 'LF'),
+            (re.compile(r'(\d+)\s*x?\s*Drehleiter|DLK', re.IGNORECASE), 'DLK'),
+            (re.compile(r'(\d+)\s*x?\s*Tanklöschfahrzeug|TLF', re.IGNORECASE), 'TLF'),
+            (re.compile(r'(\d+)\s*x?\s*Rüstwagen|RW', re.IGNORECASE), 'RW'),
+            (re.compile(r'(\d+)\s*x?\s*Gerätewagen(?!-)', re.IGNORECASE), 'GW'),  # Nicht GW-A etc.
+            (re.compile(r'(\d+)\s*x?\s*Einsatzleitwagen|ELW', re.IGNORECASE), 'ELW'),
+            (re.compile(r'(\d+)\s*x?\s*Mannschaftstransportwagen|MTW', re.IGNORECASE), 'MTW'),
+            (re.compile(r'(\d+)\s*x?\s*Funkstreifenwagen|FuStW|Polizeimotorrad', re.IGNORECASE), 'FuStW'),
+            (re.compile(r'(\d+)\s*x?\s*GW-A|GW\s*A', re.IGNORECASE), 'GW-A'),
+            (re.compile(r'(\d+)\s*x?\s*GW-L|GW\s*L', re.IGNORECASE), 'GW-L'),
+            (re.compile(r'(\d+)\s*x?\s*GW-Öl|GW\s*Öl', re.IGNORECASE), 'GW-Öl'),
+        ]
 
-        for vehicle_type, patterns in vehicle_patterns.items():
-            for pattern in patterns:
-                matches = re.findall(pattern, missing_text, re.IGNORECASE)
-                if matches:
-                    # Wenn Zahl gefunden, summiere sie; wenn leer (keine Zahl), zähle als 1
-                    count = sum(int(m) if m else 1 for m in matches)
-                    if vehicle_type in requirements:
-                        requirements[vehicle_type] = max(requirements[vehicle_type], count)
-                    else:
-                        requirements[vehicle_type] = count
+        # Single-Pass durch alle Patterns
+        for pattern, vehicle_type in vehicle_patterns:
+            matches = pattern.findall(missing_text)
+            if matches:
+                # Summe alle gefundenen Zahlen
+                count = sum(int(match) for match in matches)
+                requirements[vehicle_type] = count
 
         return requirements
 
@@ -1843,91 +2113,54 @@ class LeitstellenspielBot:
         try:
             self.logger.info(f"{Fore.CYAN}🔍 Prüfe auf Sprechwünsche...")
 
-            # Öffne die Einsatzliste
+            # Öffne die Einsatzliste und warte auf das Funk-Panel (reduziert von 10s auf 3s)
             self.driver.get(f'{self.base_url}/')
-            time.sleep(2)
-
-            # DEBUG: Speichere HTML
-            try:
-                html = self.driver.page_source
-                with open('debug_sprechwunsch.html', 'w', encoding='utf-8') as f:
-                    f.write(html)
-                self.logger.info(f"{Fore.MAGENTA}[DEBUG] HTML gespeichert: debug_sprechwunsch.html")
-            except:
-                pass
+            WebDriverWait(self.driver, 3).until(
+                EC.presence_of_element_located((By.ID, "radio_messages_important"))
+            )
 
             # Suche nach Sprechwunsch-Fahrzeug-Links im Funk-Panel
-            vehicle_links = []
-
-            # Die Sprechwünsche sind im Funk-Panel unter "radio_messages_important"
             try:
-                # Finde alle Fahrzeug-Links (nicht die "Zum Einsatz" Buttons!)
-                # Format: <a href="/vehicles/XXXXX" class="btn btn-xs btn-default lightbox-open">Fahrzeugname</a>
                 vehicle_links = self.driver.find_elements(By.CSS_SELECTOR, "#radio_messages_important a[href*='/vehicles/']")
+                if not vehicle_links:
+                    self.logger.info(f"{Fore.CYAN}✓ Keine Sprechwünsche gefunden")
+                    return 0
                 self.logger.info(f"{Fore.YELLOW}📞 {len(vehicle_links)} Sprechwünsche im Funk-Panel gefunden")
             except Exception as e:
                 self.logger.warning(f"{Fore.YELLOW}⚠ Fehler beim Suchen von Sprechwünschen: {e}")
-
-            if not vehicle_links:
-                self.logger.info(f"{Fore.CYAN}✓ Keine Sprechwünsche gefunden")
                 return 0
 
-            self.logger.info(f"{Fore.YELLOW}📞 Gefunden: {len(vehicle_links)} Sprechwünsche")
-
             processed = 0
-            # Hole die Fahrzeug-URLs aus den Links
-            vehicle_urls = []
-            for link in vehicle_links[:5]:  # Max 5 pro Durchlauf
-                try:
-                    url = link.get_attribute('href')
-                    if url:
-                        vehicle_urls.append(url)
-                except:
-                    pass
+            # Hole die Fahrzeug-URLs aus den Links (max 5 pro Durchlauf)
+            vehicle_urls = [link.get_attribute('href') for link in vehicle_links[:5] if link.get_attribute('href')]
 
             # Bearbeite jeden Sprechwunsch
             for url in vehicle_urls:
                 try:
-                    # Öffne das Fahrzeug
-                    self.driver.get(url)
-                    time.sleep(2)
-
-                    # Extrahiere Fahrzeug-ID aus URL
-                    import re
-                    match = re.search(r'/vehicles/(\d+)', url)
-                    if not match:
-                        continue
-
-                    vehicle_id = match.group(1)
+                    # Extrahiere Fahrzeug-ID aus URL für logging
+                    vehicle_id_match = re.search(r'/vehicles/(\d+)', url)
+                    vehicle_id = vehicle_id_match.group(1) if vehicle_id_match else "unbekannt"
                     self.logger.info(f"{Fore.CYAN}  Bearbeite Sprechwunsch (Fahrzeug {vehicle_id})...")
 
+                    self.driver.get(url)
+
                     # Sprechwunsch = Patient will ins Krankenhaus
-                    # Suche den ersten "Anfahren" Button (nächstes Krankenhaus)
-                    try:
-                        # Finde alle "Anfahren" Buttons
-                        anfahren_buttons = self.driver.find_elements(By.XPATH, "//a[contains(@class, 'btn-success') and contains(text(), 'Anfahren')]")
+                    # Warte auf den ersten "Anfahren" Button und klicke ihn
+                    anfahren_button = WebDriverWait(self.driver, 10).until(
+                        EC.element_to_be_clickable((By.XPATH, "(//a[contains(@class, 'btn-success') and contains(text(), 'Anfahren')])[1]"))
+                    )
+                    anfahren_button.click()
+                    
+                    self.logger.info(f"{Fore.GREEN}✓ Sprechwunsch für Fahrzeug {vehicle_id} bearbeitet (Krankenhaus ausgewählt)")
+                    processed += 1
+                    
+                    # Warte bis die Aktion verarbeitet wurde (Button wird stale) (reduziert von 5s auf 2s)
+                    WebDriverWait(self.driver, 2).until(EC.staleness_of(anfahren_button))
 
-                        if anfahren_buttons:
-                            # Klicke den ersten Button (nächstes Krankenhaus)
-                            anfahren_buttons[0].click()
-                            time.sleep(1)
-
-                            self.logger.info(f"{Fore.GREEN}✓ Sprechwunsch bearbeitet (Krankenhaus ausgewählt)")
-                            processed += 1
-                        else:
-                            self.logger.warning(f"{Fore.YELLOW}⚠ Keine Krankenhäuser gefunden")
-                    except Exception as e:
-                        self.logger.warning(f"{Fore.YELLOW}⚠ Fehler beim Auswählen des Krankenhauses: {e}")
-
-                    # Zurück zur Hauptseite
-                    self.driver.get(f'{self.base_url}/')
-                    time.sleep(1)
-
+                except (TimeoutException, NoSuchElementException):
+                    self.logger.warning(f"{Fore.YELLOW}⚠ Kein Krankenhaus zum Anfahren gefunden oder Button nicht klickbar für Fahrzeug {vehicle_id}")
                 except Exception as e:
-                    self.logger.warning(f"{Fore.YELLOW}⚠ Fehler beim Bearbeiten eines Sprechwunsches: {e}")
-                    # Zurück zur Hauptseite
-                    self.driver.get(f'{self.base_url}/')
-                    time.sleep(1)
+                    self.logger.warning(f"{Fore.YELLOW}⚠ Fehler beim Bearbeiten eines Sprechwunsches ({url}): {e}")
 
             if processed > 0:
                 self.logger.info(f"{Fore.GREEN}✓ {processed} Sprechwünsche bearbeitet")
@@ -1936,6 +2169,8 @@ class LeitstellenspielBot:
 
         except Exception as e:
             self.logger.error(f"{Fore.RED}Fehler beim Abrufen von Sprechwünschen: {e}")
+            import traceback
+            self.logger.debug(traceback.format_exc())
             return 0
 
     def check_radio_messages(self):
@@ -2025,20 +2260,29 @@ class LeitstellenspielBot:
             # Parse missing_text - DIREKT hier, SOFORT!
             missing_text = missing_text_raw
 
+            self.logger.info(f"{Fore.CYAN}>>> DEBUG: missing_text_raw = '{missing_text_raw}' (type: {type(missing_text_raw)})")
+
             # Wenn es ein Dict ist (von der API)
             if isinstance(missing_text_raw, dict):
+                self.logger.info(f"{Fore.CYAN}>>> missing_text_raw ist Dict")
                 missing_text = missing_text_raw.get('vehicles', '')
             # Wenn es ein JSON-String ist
             elif isinstance(missing_text_raw, str) and missing_text_raw.strip().startswith('{'):
+                self.logger.info(f"{Fore.CYAN}>>> missing_text_raw ist JSON-String")
                 try:
                     import json
                     missing_data = json.loads(missing_text_raw)
                     missing_text = missing_data.get('vehicles', '')
-                except:
+                    self.logger.info(f"{Fore.CYAN}>>> Extrahiert: vehicles = '{missing_text}'")
+                except Exception as e:
+                    self.logger.warning(f"{Fore.YELLOW}>>> JSON-Parse fehlgeschlagen: {e}")
                     pass
+            else:
+                self.logger.info(f"{Fore.CYAN}>>> missing_text_raw ist normaler String")
 
             self.logger.info(f"{Fore.YELLOW}[{processed+1}/{min(len(filtered_missions), max_missions)}] {mission_title} (ID: {mission_id})")
             self.logger.info(f"{Fore.YELLOW}  Fehlend: {missing_text}")
+            self.logger.info(f"{Fore.CYAN}>>> missing_text nach Parsing = '{missing_text}' (type: {type(missing_text)})")
             if patients_count > 0:
                 self.logger.info(f"{Fore.CYAN}  👤 Patienten: {patients_count}")
             elif possible_patients_count > 0:
@@ -2052,12 +2296,12 @@ class LeitstellenspielBot:
                 if self.config.get('bot', {}).get('auto_dispatch', True):
                     self.dispatch_vehicles(mission_id, mission_title, missing_text_from_api=missing_text,
                                          patients_count=patients_count, possible_patients_count=possible_patients_count)
-                    time.sleep(self.config.get('bot', {}).get('delay_between_actions', 2))
+                    time.sleep(self.config.get('bot', {}).get('delay_between_actions', 0.5))  # Reduziert von 2s
 
                 # Behandle Nachalarmierung
                 if details['has_follow_up'] and self.config.get('bot', {}).get('auto_follow_up', True):
                     self.handle_follow_up(mission_id)
-                    time.sleep(self.config.get('bot', {}).get('delay_between_actions', 2))
+                    time.sleep(self.config.get('bot', {}).get('delay_between_actions', 0.5))  # Reduziert von 2s
 
                 # Prüfe nach jedem Einsatz auf neue Sprechwünsche
                 self.check_radio_messages()
@@ -2091,6 +2335,23 @@ class LeitstellenspielBot:
                 self.logger.info(f"{Fore.MAGENTA}{'='*60}")
                 self.logger.info(f"{Fore.MAGENTA}Zyklus #{cycle} - {datetime.now().strftime('%H:%M:%S')}")
                 self.logger.info(f"{Fore.MAGENTA}{'='*60}")
+
+                # Prüfe auf Updates (alle 10 Zyklen = ca. alle 5 Minuten bei 30s Intervall)
+                if cycle % 10 == 0:
+                    try:
+                        self.logger.info(f"{Fore.CYAN}🔄 Prüfe auf Updates...")
+                        has_update, version, release_data = self.check_for_updates()
+                        if has_update:
+                            self.logger.info(f"{Fore.GREEN}🆕 Update verfügbar: Version {version}")
+                            self.logger.info(f"{Fore.YELLOW}⚠ Starte automatisches Update...")
+                            if self.auto_update(release_data):
+                                self.logger.info(f"{Fore.GREEN}✓ Update erfolgreich - Bot wird neu gestartet...")
+                                # Der Bot wird automatisch neu gestartet
+                                return
+                            else:
+                                self.logger.warning(f"{Fore.YELLOW}⚠ Update fehlgeschlagen - fahre mit alter Version fort")
+                    except Exception as e:
+                        self.logger.debug(f"Fehler beim Update-Check: {e}")
 
                 # Verarbeite Einsätze
                 self.process_missions()
@@ -2708,6 +2969,23 @@ class BotGUI:
                 self.add_log(f"\n=== Zyklus #{cycle} ===")
 
                 try:
+                    # Update-Check (alle 10 Zyklen = ca. alle 5 Minuten bei 30s Intervall)
+                    if cycle % 10 == 0 and settings.get('auto_update', True):
+                        try:
+                            self.add_log("🔄 Prüfe auf Updates...")
+                            has_update, version, release_data = self.bot.check_for_updates()
+                            if has_update:
+                                self.add_log(f"🆕 Update verfügbar: Version {version}")
+                                self.add_log("🔄 Starte automatisches Update...")
+                                if self.bot.auto_update(release_data):
+                                    self.add_log("✓ Update erfolgreich - Bot wird neu gestartet...")
+                                    # Der Bot wird automatisch neu gestartet
+                                    return
+                                else:
+                                    self.add_log("⚠ Update fehlgeschlagen - fahre mit alter Version fort")
+                        except Exception as e:
+                            self.add_log(f"⚠ Update-Check Fehler: {e}")
+
                     # Session-Check (alle 5 Zyklen)
                     if cycle % 5 == 0:
                         if not self.bot.ensure_logged_in():
@@ -2743,7 +3021,32 @@ class BotGUI:
                             self.add_log(f"[{i}/{min(len(missions), max_missions)}] {title} (ID: {mission_id})")
 
                             # Prüfe ob Einsatz Fahrzeuge braucht
-                            missing_text = mission.get('missing_text')
+                            missing_text_raw = mission.get('missing_text', '')
+                            patients_count = mission.get('patients_count', 0)
+                            possible_patients_count = mission.get('possible_patients_count', 0)
+
+                            # DEBUG: Schreibe in Datei
+                            with open('debug_missing_text.txt', 'a', encoding='utf-8') as f:
+                                f.write(f"\n=== Mission {mission.get('id')} ===\n")
+                                f.write(f"missing_text_raw type: {type(missing_text_raw)}\n")
+                                f.write(f"missing_text_raw value: {missing_text_raw}\n")
+                                if isinstance(missing_text_raw, dict):
+                                    f.write(f"IS DICT! Keys: {missing_text_raw.keys()}\n")
+                                    f.write(f"vehicles value: {missing_text_raw.get('vehicles', 'NOT FOUND')}\n")
+
+                            # Parse missing_text - extrahiere 'vehicles' aus JSON/Dict
+                            if isinstance(missing_text_raw, dict):
+                                missing_text = missing_text_raw.get('vehicles', '')
+                            elif isinstance(missing_text_raw, str) and missing_text_raw.strip().startswith('{'):
+                                try:
+                                    import json
+                                    missing_data = json.loads(missing_text_raw)
+                                    missing_text = missing_data.get('vehicles', '')
+                                except:
+                                    missing_text = missing_text_raw
+                            else:
+                                missing_text = missing_text_raw
+
                             if missing_text:
                                 self.add_log(f"  Fehlend: {missing_text}")
 
@@ -2756,15 +3059,16 @@ class BotGUI:
                                     # Alarmiere Fahrzeuge
                                     if self.bot.config.get('bot', {}).get('auto_dispatch', True):
                                         self.add_log(f"  Alarmiere Fahrzeuge...")
-                                        self.bot.dispatch_vehicles(mission_id, title)
+                                        self.bot.dispatch_vehicles(mission_id, title, missing_text_from_api=missing_text,
+                                                                 patients_count=patients_count, possible_patients_count=possible_patients_count)
                                         self.stats['missions_processed'] += 1
-                                        time.sleep(self.bot.config.get('bot', {}).get('delay_between_actions', 2))
+                                        time.sleep(self.bot.config.get('bot', {}).get('delay_between_actions', 0.5))  # Reduziert von 2s
 
                                     # Behandle Nachalarmierung
                                     if details.get('has_follow_up') and self.bot.config.get('bot', {}).get('auto_follow_up', True):
                                         self.add_log(f"  Behandle Nachalarmierung...")
                                         self.bot.handle_follow_up(mission_id)
-                                        time.sleep(self.bot.config.get('bot', {}).get('delay_between_actions', 2))
+                                        time.sleep(self.bot.config.get('bot', {}).get('delay_between_actions', 0.5))  # Reduziert von 2s
 
                                     self.add_log(f"  OK Einsatz bearbeitet")
 
@@ -2790,7 +3094,7 @@ class BotGUI:
                                 self.add_log(f"  FEHLER: {str(e)}")
 
                             # Kurze Pause zwischen Einsätzen
-                            time.sleep(2)
+                            time.sleep(0.3)  # Reduziert von 2s
 
                     # Gebäude-Ausbau (alle 10 Zyklen)
                     if settings.get('auto_expand', False) and (cycle % 10 == 0):
