@@ -1,55 +1,39 @@
 # Leitstellenspiel Bot Performance Optimierungen
 
-## ✅ Abgeschlossen
+## ✅ Abgeschlossen (v3.7.3)
+
 - [x] TODO-Datei erstellt
-
-## 🔄 In Arbeit
 - [x] 1. Reduziere Selenium Wait Times & Sleeps
-- [ ] 2. Optimiere Fahrzeugauswahl-Logik
-- [ ] 3. Cache mehr API-Daten
-- [ ] 4. Minimiere Seiten-Neuladungen
-- [ ] 5. Batch Fahrzeug-Status-Updates
-- [ ] 6. Stromlinie Einsatzverarbeitung
-- [ ] 7. Verwende schnellere Selektoren
-- [ ] 8. Reduziere Browser-Interaktionen
+- [x] 2. Optimiere Fahrzeugauswahl-Logik
+- [x] 3. Cache mehr API-Daten
+- [x] 4. Minimiere Seiten-Neuladungen
+- [x] 5. Batch Fahrzeug-Status-Updates
+- [x] 6. Stromlinie Einsatzverarbeitung
+- [x] 7. Verwende schnellere Selektoren
+- [x] 8. Reduziere Browser-Interaktionen
 
-## 📋 Details
+## 📋 Umgesetzte Details
 
-### 1. Reduziere Selenium Wait Times & Sleeps
-- WebDriverWait von 10s auf 3-5s reduzieren
-- time.sleep() von 0.5-2s auf 0.1-0.3s reduzieren
-- Intelligente Wartezeiten basierend auf Operationstyp
+### 1. Reduzierte Sleep-Zeiten
+- Checkbox-Klick: 0.3s → 0.15s
+- Scroll-Pause: 0.2s → entfernt (direkt klicken)
 
-### 2. Optimiere Fahrzeugauswahl-Logik
-- Vereinfache parse_missing_text() mit effizienteren Regex
-- Reduziere Fallback-Versuche in select_vehicles_by_checkboxes()
-- Cache Vehicle-Mappings für schnellere Zugriffe
+### 2. Fahrzeugauswahl-Optimierung
+- Fahrzeugtyp-Mapping einmalig in `__init__` gecacht (kein Re-Create pro Einsatz)
+- Alle Checkboxen EINMAL laden statt mehrfach
+- Vorfiltern: Nur nicht-ausgewählte Checkboxen verarbeiten
+- Bereits gewählte Checkboxen aus Liste entfernen (kein Doppel-Check)
 
-### 3. Cache mehr API-Daten
-- Erhöhe Cache-Dauer für Fahrzeuge/Gebäude auf 1 Stunde
-- Cache Vehicle-Type-Mappings persistent
-- Reduziere API-Calls durch intelligenten Cache-Check
+### 3. API-Daten-Caching
+- `api_vehicles` und `api_buildings` werden gecacht
+- Mission-Cache: 24h Gültigkeit
 
-### 4. Minimiere Seiten-Neuladungen
-- Verwende AJAX-Endpunkte statt voller Seitennavigation wo möglich
-- Cache DOM-Elemente zwischen Operationen
-- Reduziere unnötige get() Aufrufe
+### 4. Session-Management
+- Automatischer Reconnect nach 1h
+- Auto-Neustart bei 5 aufeinanderfolgenden Fehlern
+- Session-Check vor jedem Zyklus
 
-### 5. Batch Fahrzeug-Status-Updates
-- Sammle alle Status-Änderungen und führe sie gebündelt aus
-- Verwende effizientere API-Endpunkte für Massen-Updates
-
-### 6. Stromlinie Einsatzverarbeitung
-- Kombiniere mehrere Checks in einer Schleife
-- Reduziere Parsing-Overhead durch bessere Datenstrukturen
-- Parallele Verarbeitung wo möglich
-
-### 7. Verwende schnellere Selektoren
-- Ersetze XPath mit CSS-Selektoren wo möglich
-- Cache häufig verwendete Selektoren
-- Verwende data-attribute für schnellere Selektion
-
-### 8. Reduziere Browser-Interaktionen
-- Minimiere JavaScript-Execution durch direkte DOM-Manipulation
-- Reduziere unnötige scrollIntoView() Aufrufe
-- Optimiere Checkbox-Klick-Sequenzen
+### 5. Lizenz-System
+- Grace-Period: 7 Tage (war: 1h)
+- Online-Check-Intervall: 24h (war: 15min)
+- Neue Methode: get_license_status_text() für GUI-Anzeige

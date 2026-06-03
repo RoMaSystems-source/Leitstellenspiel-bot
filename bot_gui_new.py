@@ -95,6 +95,10 @@ class BotGUI:
         self.update_log_display()
         self.update_stats_display()
 
+        # Update-Check im Hintergrund starten
+        if self.settings.get('auto_update', True):
+            threading.Thread(target=self.check_for_updates, daemon=True).start()
+
     def check_license(self):
         """Prüft Lizenz beim Start"""
         # Prüfe ob Lizenz vorhanden
@@ -198,6 +202,132 @@ class BotGUI:
 
         # Entferne nach 2 Sekunden
         self.root.after(2000, notif.destroy)
+
+    def check_for_updates(self):
+        """Prüft im Hintergrund ob ein Update verfügbar ist"""
+        try:
+            # Warte 3 Sekunden nach Start (GUI soll erst vollständig laden)
+            time.sleep(3)
+
+            # Lese lokale Version
+            try:
+                if getattr(sys, 'frozen', False):
+                    base_path = sys._MEIPASS
+                else:
+                    base_path = os.path.dirname(__file__)
+                version_file = os.path.join(base_path, 'version.txt')
+                with open(version_file, 'r') as f:
+                    local_version = f.read().strip()
+            except:
+                local_version = "0.0.0"
+
+            # Update-URL: aus config.json oder Default (GitHub)
+            update_url = "https://raw.githubusercontent.com/RoMaSystems-source/Leitstellenspiel-bot/main/version.json"
+            try:
+                config_path = os.path.join(os.getcwd(), 'config.json')
+                if os.path.exists(config_path):
+                    with open(config_path, 'r', encoding='utf-8') as f:
+                        cfg = json.load(f)
+                    update_url = cfg.get('update_url', update_url)
+            except:
+                pass
+
+            # Hole Remote-Version
+            response = requests.get(update_url, timeout=10)
+            response.raise_for_status()
+            remote_data = response.json()
+            remote_version = remote_data.get('version', '0.0.0')
+            changelog = remote_data.get('changelog', '')
+            download_url = remote_data.get('gui_download_url', remote_data.get('download_url', ''))
+
+            # Vergleiche Versionen
+            def parse_version(v):
+                try:
+                    return tuple(int(x) for x in v.strip().split('.'))
+                except:
+                    return (0, 0, 0)
+
+            if parse_version(remote_version) > parse_version(local_version):
+                # Update verfügbar - zeige Banner im Hauptthread
+                self.root.after(0, lambda: self._show_update_banner(
+                    local_version, remote_version, changelog, download_url
+                ))
+            else:
+                print(f"[Update] Aktuell (v{local_version})")
+
+        except requests.exceptions.ConnectionError:
+            print("[Update] Kein Internet - Update-Check übersprungen")
+        except Exception as e:
+            print(f"[Update] Fehler beim Update-Check: {e}")
+
+    def _show_update_banner(self, local_version, remote_version, changelog, download_url):
+        """Zeigt einen Update-Banner im Header an"""
+        import webbrowser
+
+        # Update-Banner Frame (unter dem Header)
+        self.update_banner = ctk.CTkFrame(
+            self.root,
+            fg_color="#e67e22",
+            corner_radius=0,
+            height=50
+        )
+        self.update_banner.pack(fill="x", padx=0, pady=0, before=self.tabview)
+        self.update_banner.pack_propagate(False)
+
+        # Linke Seite: Update-Text
+        update_text = ctk.CTkLabel(
+            self.update_banner,
+            text=f"🆕  Update verfügbar: v{local_version} → v{remote_version}   |   {changelog}",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            text_color="white"
+        )
+        update_text.pack(side="left", padx=20, pady=10)
+
+        # Rechte Seite: Buttons
+        btn_frame = ctk.CTkFrame(self.update_banner, fg_color="transparent")
+        btn_frame.pack(side="right", padx=10, pady=5)
+
+        # Download-Button
+        if download_url:
+            download_btn = ctk.CTkButton(
+                btn_frame,
+                text="⬇ Jetzt herunterladen",
+                command=lambda: webbrowser.open(download_url),
+                height=35,
+                font=ctk.CTkFont(size=12, weight="bold"),
+                fg_color="#2ecc71",
+                hover_color="#27ae60",
+                corner_radius=8
+            )
+            download_btn.pack(side="left", padx=5)
+
+        # Schließen-Button
+        close_btn = ctk.CTkButton(
+            btn_frame,
+            text="✕",
+            command=self._close_update_banner,
+            height=35,
+            width=35,
+            font=ctk.CTkFont(size=14, weight="bold"),
+            fg_color="#c0392b",
+            hover_color="#922b21",
+            corner_radius=8
+        )
+        close_btn.pack(side="left", padx=5)
+
+        # Auch im Log anzeigen
+        self.add_log(f"🆕 UPDATE VERFÜGBAR: v{remote_version} (aktuell: v{local_version})")
+        if changelog:
+            self.add_log(f"   Änderungen: {changelog}")
+        if download_url:
+            self.add_log(f"   Download: {download_url}")
+
+    def _close_update_banner(self):
+        """Schließt den Update-Banner"""
+        try:
+            self.update_banner.destroy()
+        except:
+            pass
 
     def toggle_theme(self):
         """Wechselt zwischen Dark und Light Mode"""

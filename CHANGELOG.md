@@ -12,7 +12,7 @@ Ein Hotfix, der Probleme beim Erstellen der `.exe`-Datei behebt.
 - **Problem**: Ein Syntaxfehler (`IndentationError`) im Code verhinderte das Erstellen der `.exe`-Datei.
 - **Lösung**: Der fehlerhafte Code wurde korrigiert, sodass der Build-Prozess wieder erfolgreich durchläuft.
 
-#### 2. Robusteres Build-Skript
+#### 2. Robusteres Build-Skriptdas
 - **Problem**: Das Build-Skript schlug fehl, wenn der `python`-Befehl nicht im System-PATH gefunden wurde.
 - **Lösung**: Das Skript verwendet jetzt `py.exe`, was unter Windows zuverlässiger ist.
 - **Ergebnis**: Der Build-Prozess ist jetzt robuster gegenüber unterschiedlichen System-Konfigurationen.

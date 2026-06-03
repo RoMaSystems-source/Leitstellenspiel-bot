@@ -8,6 +8,7 @@ Automatisiert das Abarbeiten von Einsätzen und Nachalarmierungen
 import requests
 from bs4 import BeautifulSoup
 import json
+import re
 import time
 import logging
 from datetime import datetime
@@ -22,6 +23,7 @@ from selenium.common.exceptions import TimeoutException, NoSuchElementException,
 from selenium.webdriver.chrome.options import Options as ChromeOptions
 from selenium.webdriver.firefox.options import Options as FirefoxOptions
 import random
+import traceback
 from vehicle_types import VEHICLE_TYPES, CATEGORY_TO_TYPES
 
 # Colorama initialisieren
@@ -49,6 +51,31 @@ class LeitstellenspielBot:
         self.api_vehicles = []
         self.api_buildings = []
         self.api_vehicle_types = {}  # Mapping von vehicle_type ID zu Name
+
+        # Fahrzeugtyp-Mapping (einmalig gecacht für Performance)
+        self._vehicle_type_mapping = {
+            'LF': ['lf_only', 'hlf_only', 'fire'],
+            'DLK': ['dlk'],
+            'RW': ['rw', 'ab_ruest_rw'],
+            'ELW': ['elw', 'kdow_elw', 'elw_or_battalion_chief_vehicle'],
+            'GW-A': ['gw_a', 'gwa'],
+            'TLF': ['tlf'],
+            'RTW': ['rtw', 'ambulance'],
+            'NEF': ['nef'],
+            'KTW': ['ktw', 'patient_transport'],
+            'RTH': ['rth'],
+            'FuStW': ['fustw', 'fustw_or_police_motorcycle'],
+            'GefKw': ['gefkw'],
+            'FwK': ['fwk'],
+            'Hundestaffel': ['k9'],
+        }
+        self._fallback_mapping = {
+            'KTW': 'RTW',
+        }
+
+        # Reconnect-Tracking
+        self._last_login_time = None
+        self._session_max_age = 3600  # Session nach 1h erneuern
         
     def load_config(self, config_path):
         """Lädt die Konfigurationsdatei"""
@@ -917,71 +944,49 @@ class LeitstellenspielBot:
             return False
 
     def select_vehicles_by_checkboxes(self, requirements):
-        """Wählt Fahrzeuge über Checkboxen aus basierend auf Anforderungen"""
+        """Wählt Fahrzeuge über Checkboxen aus basierend auf Anforderungen (optimiert)"""
         try:
-            # Mapping von internen Namen zu Checkbox-Attributen
-            # Basierend auf den tatsächlichen HTML-Attributen
-            vehicle_type_mapping = {
-                'LF': ['lf_only', 'hlf_only', 'fire'],  # Löschfahrzeuge (fire=1 ist generisch für Feuerwehr)
-                'DLK': ['dlk'],  # Drehleiter
-                'RW': ['rw', 'ab_ruest_rw'],  # Rüstwagen
-                'ELW': ['elw', 'kdow_elw', 'elw_or_battalion_chief_vehicle'],  # Einsatzleitwagen
-                'GW-A': ['gw_a', 'gwa'],  # Atemschutz
-                'TLF': ['tlf'],  # Tanklöschfahrzeug
-                'RTW': ['rtw', 'ambulance'],  # Rettungswagen
-                'NEF': ['nef'],  # Notarzteinsatzfahrzeug
-                'KTW': ['ktw', 'patient_transport'],  # Krankentransportwagen
-                'RTH': ['rth'],  # Rettungshubschrauber
-                'FuStW': ['fustw', 'fustw_or_police_motorcycle'],  # Funkstreifenwagen
-                'GefKw': ['gefkw'],  # Gefangenenkraftwagen
-                'FwK': ['fwk'],  # Feuerwehrkran
-                'Hundestaffel': ['k9'],  # Hundeführer
-            }
-
-            # Fallback-Mapping: Wenn Fahrzeugtyp nicht verfügbar, verwende Alternative
-            fallback_mapping = {
-                'KTW': 'RTW',  # Wenn kein KTW verfügbar, nimm RTW
-            }
+            # Nutze gecachtes Mapping aus __init__
+            vehicle_type_mapping = self._vehicle_type_mapping
+            fallback_mapping = self._fallback_mapping
 
             selected_count = 0
 
+            # Alle Checkboxen EINMAL laden (Performance-Optimierung)
+            all_checkboxes = self.driver.find_elements(By.CLASS_NAME, "vehicle_checkbox")
+            self.logger.debug(f"Gesamt Checkboxen gefunden: {len(all_checkboxes)}")
+
+            # Vorfiltern: Nur nicht-ausgewählte Checkboxen
+            available_checkboxes = [cb for cb in all_checkboxes if not cb.is_selected()]
+
             for vehicle_type, count_needed in requirements.items():
-                # Hole alle Checkboxen
-                checkboxes = self.driver.find_elements(By.CLASS_NAME, "vehicle_checkbox")
+                attr_names = vehicle_type_mapping.get(vehicle_type, [vehicle_type.lower()])
 
                 # Finde passende Checkboxen für diesen Fahrzeugtyp
                 matching_checkboxes = []
-                attr_names = vehicle_type_mapping.get(vehicle_type, [vehicle_type.lower()])
-
-                for checkbox in checkboxes:
-                    # Prüfe ob Checkbox bereits ausgewählt ist
-                    if checkbox.is_selected():
-                        continue
-
-                    # Prüfe alle möglichen Attributnamen
+                for checkbox in available_checkboxes:
                     for attr_name in attr_names:
                         try:
-                            attr_value = checkbox.get_attribute(attr_name)
-                            if attr_value == "1":
+                            if checkbox.get_attribute(attr_name) == "1":
                                 matching_checkboxes.append(checkbox)
                                 break
-                        except:
+                        except Exception:
                             pass
 
                 # Wähle die benötigte Anzahl aus
                 selected_for_this_type = 0
                 for i in range(min(count_needed, len(matching_checkboxes))):
                     try:
-                        # Scrolle zur Checkbox damit sie sichtbar ist
-                        self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", matching_checkboxes[i])
-                        time.sleep(0.2)
-
-                        # Klicke die Checkbox
-                        self.driver.execute_script("arguments[0].click();", matching_checkboxes[i])
+                        cb = matching_checkboxes[i]
+                        self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", cb)
+                        self.driver.execute_script("arguments[0].click();", cb)
                         selected_count += 1
                         selected_for_this_type += 1
+                        # Aus available_checkboxes entfernen damit es nicht doppelt gewählt wird
+                        if cb in available_checkboxes:
+                            available_checkboxes.remove(cb)
                         self.logger.info(f"{Fore.GREEN}✓ {vehicle_type} #{i+1} ausgewählt")
-                        time.sleep(0.3)
+                        time.sleep(0.15)  # Reduziert von 0.3s auf 0.15s
                     except Exception as e:
                         self.logger.warning(f"{Fore.YELLOW}⚠ Fehler beim Auswählen von {vehicle_type}: {e}")
 
@@ -992,35 +997,29 @@ class LeitstellenspielBot:
 
                     if fallback_type:
                         self.logger.info(f"{Fore.CYAN}Versuche Fallback: {fallback_type} statt {vehicle_type}")
-
-                        # Hole neue Checkboxen-Liste
-                        checkboxes = self.driver.find_elements(By.CLASS_NAME, "vehicle_checkbox")
-                        fallback_checkboxes = []
                         fallback_attr_names = vehicle_type_mapping.get(fallback_type, [fallback_type.lower()])
 
-                        for checkbox in checkboxes:
-                            if checkbox.is_selected():
-                                continue
-
+                        fallback_checkboxes = []
+                        for checkbox in available_checkboxes:
                             for attr_name in fallback_attr_names:
                                 try:
-                                    attr_value = checkbox.get_attribute(attr_name)
-                                    if attr_value == "1":
+                                    if checkbox.get_attribute(attr_name) == "1":
                                         fallback_checkboxes.append(checkbox)
                                         break
-                                except:
+                                except Exception:
                                     pass
 
-                        # Wähle Fallback-Fahrzeuge
                         for i in range(min(still_needed, len(fallback_checkboxes))):
                             try:
-                                self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", fallback_checkboxes[i])
-                                time.sleep(0.2)
-                                self.driver.execute_script("arguments[0].click();", fallback_checkboxes[i])
+                                cb = fallback_checkboxes[i]
+                                self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", cb)
+                                self.driver.execute_script("arguments[0].click();", cb)
                                 selected_count += 1
                                 selected_for_this_type += 1
+                                if cb in available_checkboxes:
+                                    available_checkboxes.remove(cb)
                                 self.logger.info(f"{Fore.GREEN}✓ {fallback_type} #{i+1} (Fallback für {vehicle_type}) ausgewählt")
-                                time.sleep(0.3)
+                                time.sleep(0.15)
                             except Exception as e:
                                 self.logger.warning(f"{Fore.YELLOW}⚠ Fehler beim Auswählen von {fallback_type}: {e}")
 
@@ -1699,10 +1698,32 @@ class LeitstellenspielBot:
 
         self.logger.info(f"{Fore.GREEN}✓ {processed} Einsätze bearbeitet")
 
+    def check_session(self):
+        """Prüft ob die Session noch gültig ist und erneuert sie bei Bedarf"""
+        try:
+            # Prüfe ob Session-Cookies noch gültig sind
+            response = self.session.get(f'{self.base_url}/api/vehicles', timeout=10)
+            if response.status_code == 401 or 'sign_in' in response.url:
+                self.logger.warning(f"{Fore.YELLOW}⚠ Session abgelaufen - erneuere Login...")
+                self.logged_in = False
+                # Cookies löschen
+                self.session.cookies.clear()
+                # Neu einloggen
+                if self.login():
+                    self.logger.info(f"{Fore.GREEN}✓ Session erfolgreich erneuert")
+                    return True
+                else:
+                    self.logger.error(f"{Fore.RED}✗ Session-Erneuerung fehlgeschlagen!")
+                    return False
+            return True
+        except Exception as e:
+            self.logger.warning(f"{Fore.YELLOW}⚠ Session-Check fehlgeschlagen: {e}")
+            return True  # Im Zweifel weitermachen
+
     def run(self):
         """Hauptschleife des Bots"""
         print(f"{Fore.CYAN}{'='*60}")
-        print(f"{Fore.CYAN}  Leitstellenspiel.de Bot (Selenium)")
+        print(f"{Fore.CYAN}  Leitstellenspiel.de Bot v3.7.3")
         print(f"{Fore.CYAN}{'='*60}\n")
 
         # Initialisiere Browser
@@ -1716,17 +1737,50 @@ class LeitstellenspielBot:
                 self.close_browser()
                 return
 
+            self._last_login_time = time.time()
             print(f"\n{Fore.GREEN}Bot läuft... (Strg+C zum Beenden)\n")
 
             cycle = 0
+            consecutive_errors = 0
+            max_consecutive_errors = 5
+
             while True:
                 cycle += 1
                 self.logger.info(f"{Fore.MAGENTA}{'='*60}")
                 self.logger.info(f"{Fore.MAGENTA}Zyklus #{cycle} - {datetime.now().strftime('%H:%M:%S')}")
                 self.logger.info(f"{Fore.MAGENTA}{'='*60}")
 
-                # Verarbeite Einsätze
-                self.process_missions()
+                try:
+                    # Session-Check alle 60 Minuten
+                    if self._last_login_time and (time.time() - self._last_login_time) > self._session_max_age:
+                        self.logger.info(f"{Fore.CYAN}🔄 Session-Check (>1h seit letztem Login)...")
+                        self.check_session()
+                        self._last_login_time = time.time()
+
+                    # Verarbeite Einsätze
+                    self.process_missions()
+                    consecutive_errors = 0  # Reset bei Erfolg
+
+                except Exception as e:
+                    consecutive_errors += 1
+                    self.logger.error(f"{Fore.RED}Fehler in Zyklus #{cycle}: {e}")
+                    self.logger.error(traceback.format_exc())
+
+                    if consecutive_errors >= max_consecutive_errors:
+                        self.logger.error(f"{Fore.RED}Zu viele Fehler ({consecutive_errors}) - versuche Neustart...")
+                        try:
+                            self.close_browser()
+                            time.sleep(10)
+                            if self.init_browser(headless=headless) and self.login():
+                                self._last_login_time = time.time()
+                                consecutive_errors = 0
+                                self.logger.info(f"{Fore.GREEN}✓ Bot erfolgreich neugestartet")
+                            else:
+                                self.logger.error(f"{Fore.RED}Neustart fehlgeschlagen - beende Bot")
+                                break
+                        except Exception as restart_e:
+                            self.logger.error(f"{Fore.RED}Neustart-Fehler: {restart_e}")
+                            break
 
                 # Warte bis zum nächsten Durchlauf
                 wait_time = self.config.get('bot', {}).get('check_interval', 30)
@@ -1738,7 +1792,6 @@ class LeitstellenspielBot:
             self.logger.info("Bot wurde vom Benutzer beendet")
         except Exception as e:
             self.logger.error(f"{Fore.RED}Unerwarteter Fehler: {e}")
-            import traceback
             self.logger.error(traceback.format_exc())
         finally:
             self.close_browser()
@@ -1747,5 +1800,4 @@ class LeitstellenspielBot:
 if __name__ == '__main__':
     bot = LeitstellenspielBot()
     bot.run()
-
 

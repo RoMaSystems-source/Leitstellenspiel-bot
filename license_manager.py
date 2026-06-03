@@ -5,25 +5,15 @@ Validiert Lizenzen gegen MySQL-Datenbank
 
 import json
 import os
-import time
-import hashlib
-import platform
-import uuid
-from datetime import datetime, timedelta
-import pymysql
-from colorama import Fore
-
-import json
-import os
 import sys
 import time
 import hashlib
 import platform
 import uuid
+import base64
 from datetime import datetime, timedelta
 import pymysql
 from colorama import Fore
-import base64
 
 class LicenseManager:
     def __init__(self):
@@ -34,6 +24,11 @@ class LicenseManager:
         self.license_cache_file = 'cache/license_cache.json'
         self.license_key = None
         self.hardware_id = self.get_hardware_id()
+        
+        # Grace-Period: 7 Tage Offline-Nutzung nach letztem Online-Check
+        self.GRACE_PERIOD_DAYS = 7
+        # Online-Check alle 24 Stunden erzwingen
+        self.ONLINE_CHECK_INTERVAL_HOURS = 24
         
         # Erstelle cache-Ordner falls nicht vorhanden
         if not os.path.exists('cache'):
@@ -77,17 +72,20 @@ class LicenseManager:
             try:
                 mac = ':'.join(['{:02x}'.format((uuid.getnode() >> elements) & 0xff) 
                                for elements in range(0,2*6,2)][::-1])
-            except:
+            except Exception:
                 mac = "unknown"
             
             # Erstelle Hash
             hw_string = f"{system}-{node}-{machine}-{mac}"
             return hashlib.sha256(hw_string.encode()).hexdigest()[:32]
-        except:
+        except Exception:
             return "unknown"
     
     def connect_db(self):
         """Verbindet zur Datenbank"""
+        if not self.db_config:
+            print(f"{Fore.RED}FEHLER: Keine DB-Konfiguration geladen.")
+            return None
         try:
             connection = pymysql.connect(
                 host=self.db_config['host'],
@@ -95,7 +93,8 @@ class LicenseManager:
                 user=self.db_config['user'],
                 password=self.db_config['password'],
                 database=self.db_config['database'],
-                charset=self.db_config['charset'],
+                charset=self.db_config.get('charset', 'utf8mb4'),
+                connect_timeout=10,
                 cursorclass=pymysql.cursors.DictCursor
             )
             return connection
@@ -134,14 +133,8 @@ class LicenseManager:
                     if isinstance(expires_at, str):
                         expires_at = datetime.strptime(expires_at, '%Y-%m-%d %H:%M:%S')
                     
-                    # Debug-Log: Ablaufdatum
-                    try:
-                        print(f"{Fore.CYAN}Lizenz-DB: expires_at={expires_at} is_active={result.get('is_active')} hw_id_db={result.get('hardware_id')}")
-                    except:
-                        pass
-
                     if datetime.now() > expires_at:
-                        return False, "Lizenz abgelaufen"
+                        return False, f"Lizenz abgelaufen (am {expires_at.strftime('%d.%m.%Y')})"
                 
                 # Prüfe Hardware-ID (falls gesetzt)
                 db_hardware_id = result.get('hardware_id')
@@ -157,6 +150,7 @@ class LicenseManager:
                     """
                     cursor.execute(update_sql, (self.hardware_id, license_key))
                     conn.commit()
+                    print(f"{Fore.GREEN}✓ Lizenz erfolgreich an dieses Gerät gebunden.")
                 else:
                     # Update last_check
                     update_sql = "UPDATE licenses SET last_check = NOW() WHERE license_key = %s"
@@ -192,7 +186,7 @@ class LicenseManager:
 
             with open(self.license_cache_file, 'r', encoding='utf-8') as f:
                 return json.load(f)
-        except:
+        except Exception:
             return None
 
     def check_license(self, license_key=None, force_online=False):
@@ -221,7 +215,7 @@ class LicenseManager:
         # Online-Check wenn:
         # - force_online = True
         # - Kein Cache vorhanden
-        # - Cache älter als 24h
+        # - Cache älter als ONLINE_CHECK_INTERVAL_HOURS (24h)
         # - Hardware-ID stimmt nicht überein
         need_online_check = force_online
 
@@ -235,10 +229,10 @@ class LicenseManager:
                 last_check = datetime.fromisoformat(cache.get('last_check', ''))
                 cache_age = datetime.now() - last_check
 
-                if cache_age > timedelta(minutes=15):
+                if cache_age > timedelta(hours=self.ONLINE_CHECK_INTERVAL_HOURS):
                     need_online_check = True
-                    print(f"{Fore.YELLOW}⚠ Lizenz-Cache älter als 15 Minuten - Online-Check erforderlich")
-            except:
+                    print(f"{Fore.YELLOW}⚠ Lizenz-Cache älter als {self.ONLINE_CHECK_INTERVAL_HOURS}h - Online-Check erforderlich")
+            except Exception:
                 need_online_check = True
         else:
             need_online_check = True
@@ -248,8 +242,8 @@ class LicenseManager:
             valid, message = self.validate_license_online(license_key)
 
             if valid:
-                # Speichere Cache (max. 1 Stunde Grace-Period)
-                valid_until = datetime.now() + timedelta(hours=1)
+                # Speichere Cache mit 7-Tage Grace-Period
+                valid_until = datetime.now() + timedelta(days=self.GRACE_PERIOD_DAYS)
                 self.save_license_cache(license_key, valid_until)
                 self.license_key = license_key
                 return True, "Lizenz gültig (Online-Check)"
@@ -259,10 +253,14 @@ class LicenseManager:
                     try:
                         valid_until = datetime.fromisoformat(cache.get('valid_until', ''))
                         if datetime.now() < valid_until:
-                            print(f"{Fore.YELLOW}⚠ Online-Check fehlgeschlagen, nutze Cache (Grace-Period)")
+                            remaining = valid_until - datetime.now()
+                            remaining_days = remaining.days
+                            print(f"{Fore.YELLOW}⚠ Online-Check fehlgeschlagen, nutze Cache (noch {remaining_days} Tag(e) Grace-Period)")
                             self.license_key = license_key
-                            return True, f"Lizenz gültig (Offline-Modus, {message})"
-                    except:
+                            return True, f"Lizenz gültig (Offline-Modus, noch {remaining_days} Tag(e))"
+                        else:
+                            return False, "Grace-Period abgelaufen - Internetverbindung erforderlich"
+                    except Exception:
                         pass
 
                 return False, message
@@ -272,11 +270,12 @@ class LicenseManager:
             try:
                 valid_until = datetime.fromisoformat(cache.get('valid_until', ''))
                 if datetime.now() < valid_until:
+                    remaining = valid_until - datetime.now()
                     self.license_key = license_key
-                    return True, "Lizenz gültig (Offline-Cache)"
+                    return True, f"Lizenz gültig (Offline-Cache, noch {remaining.days} Tag(e))"
                 else:
                     return False, "Grace-Period abgelaufen - Online-Check erforderlich"
-            except:
+            except Exception:
                 return False, "Ungültiger Cache"
 
         return False, "Keine gültige Lizenz gefunden"
@@ -302,6 +301,24 @@ class LicenseManager:
                 result = cursor.fetchone()
                 conn.close()
                 return result
-        except:
+        except Exception:
             return None
 
+    def get_license_status_text(self):
+        """Gibt einen lesbaren Status-Text zurück (für GUI)"""
+        cache = self.load_license_cache()
+        if not cache:
+            return "Keine Lizenz aktiviert", False
+        
+        license_key = cache.get('license_key', '')
+        masked_key = license_key[:4] + "****" + license_key[-4:] if len(license_key) >= 8 else "****"
+        
+        try:
+            valid_until = datetime.fromisoformat(cache.get('valid_until', ''))
+            if datetime.now() < valid_until:
+                remaining = valid_until - datetime.now()
+                return f"Lizenz aktiv ({masked_key}) - noch {remaining.days} Tag(e)", True
+            else:
+                return f"Lizenz abgelaufen ({masked_key})", False
+        except Exception:
+            return "Lizenz-Status unbekannt", False

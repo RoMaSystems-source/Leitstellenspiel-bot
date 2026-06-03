@@ -1,10 +1,7 @@
 {
-  "version": "3.7.6",
-  "release_date": "2026-01-12",
-  "changelog": [
-    "VERBESSERUNG: Lizenzprüfung alle 5 Minuten statt alle 10 Minuten für bessere Sicherheit.",
-    "VERSION: Version auf 3.7.6 erhöht."
-  ],
-  "download_url": "https://github.com/RoMaSystems-source/Leitstellenspiel-bot/releases/latest",
-  "mandatory": false
+  "version": "3.7.3",
+  "release_date": "2026-06-03",
+  "download_url": "https://github.com/RoMaSystems-source/Leitstellenspiel-bot/releases/download/v3.7.3/Leitstellenspiel-Bot-v3.7.3.exe",
+  "gui_download_url": "https://github.com/RoMaSystems-source/Leitstellenspiel-bot/releases/download/v3.7.3/Leitstellenspiel-Bot-GUI-v3.7.3.exe",
+  "changelog": "v3.7.3: Bugfixes, Performance-Optimierungen, Auto-Reconnect, verbessertes Lizenz-System"
 }
